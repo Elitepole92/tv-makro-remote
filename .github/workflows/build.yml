@@ -1,0 +1,70 @@
+# Baut die Firmware fuer den M5StickS3 und stellt sie als Release bereit.
+# Der Stick holt sich das neueste Release ueber Einstellungen -> Update.
+name: Firmware bauen
+
+on:
+  push:
+    branches: [main]
+    paths: ['tv_makro_remote/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-m5stack-${{ runner.os }}-v1
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Boardpaket und Bibliothek installieren
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+          arduino-cli core update-index
+          arduino-cli core install m5stack:esp32
+          arduino-cli lib update-index
+          arduino-cli lib install M5Unified
+          FQBN=$(arduino-cli board listall --format json | jq -r '[.boards[] | select(.name | test("sticks3"; "i"))][0].fqbn')
+          echo "Gefundenes Board: $FQBN"
+          if [ -z "$FQBN" ] || [ "$FQBN" = "null" ]; then
+            echo "StickS3 nicht im Boardpaket gefunden. Verfuegbare M5-Sticks:"
+            arduino-cli board listall | grep -i stick || true
+            exit 1
+          fi
+          echo "FQBN=$FQBN" >> "$GITHUB_ENV"
+
+      - name: Kompilieren
+        run: |
+          V=$(tr -d ' \r\n' < tv_makro_remote/VERSION)
+          echo "FWNAME=$V" >> "$GITHUB_ENV"
+          printf '#define FW_BUILD %s\n#define FW_NAME "%s"\n' "${{ github.run_number }}" "$V" > tv_makro_remote/version.h
+          cat tv_makro_remote/version.h
+          arduino-cli compile --fqbn "$FQBN" --output-dir build tv_makro_remote
+          ls -la build
+
+      - name: Release veroeffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build/tv_makro_remote.ino.bin firmware.bin
+          # Zeile 1: Build-Nummer (vergleicht der Stick), Zeile 2: sichtbare Version
+          printf '%s\n%s\n' "${{ github.run_number }}" "$FWNAME" > version.txt
+          # gleiche Version nochmal gebaut: altes Release ersetzen
+          if gh release view "v$FWNAME" >/dev/null 2>&1; then gh release delete "v$FWNAME" --cleanup-tag -y; fi
+          gh release create "v$FWNAME" firmware.bin version.txt \
+            --title "TV-Makro-Remote $FWNAME" \
+            --notes "Build ${{ github.run_number }} aus ${{ github.sha }}. Aenderungen: siehe CHANGELOG.md" --latest

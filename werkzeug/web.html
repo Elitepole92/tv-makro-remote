@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TV-Makros</title>
+<style>
+:root{--bg:#f3f4f6;--card:#fff;--fg:#111;--mut:#666;--line:#eee;--btn:#e5e7eb;--acc:#1f6feb;--warn:#fff7d6}
+@media(prefers-color-scheme:dark){:root{--bg:#111418;--card:#1c1f24;--fg:#e6e8eb;--mut:#9aa3ad;--line:#2b313a;--btn:#2f343c;--acc:#4c8dff;--warn:#3a3010}}
+body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg)}
+header{background:var(--acc);color:#fff;padding:12px 16px;font-weight:600}
+main{max-width:640px;margin:auto;padding:12px}
+.card{background:var(--card);border-radius:10px;padding:12px;margin-bottom:12px;box-shadow:0 1px 3px #0003}
+.row{display:flex;align-items:center;gap:6px;padding:7px 0;border-top:1px solid var(--line)}
+.grow{flex:1;min-width:0;overflow-wrap:anywhere}
+.mut{color:var(--mut);font-size:.85em}
+button{border:0;border-radius:6px;padding:8px 10px;background:var(--btn);color:var(--fg);font-size:.95em;cursor:pointer}
+button:disabled{opacity:.4}
+.p{background:var(--acc);color:#fff}.d{color:#d33}
+h2{font-size:1.1em;margin:0 0 4px;display:flex;align-items:center;gap:6px}
+#st{display:none;background:var(--warn)}
+</style></head><body>
+<header>TV-Makro-Fernbedienung</header>
+<main>
+<div class="card" id="st"></div>
+<div id="tvs">Lade...</div>
+<button class="p" onclick="addTv()">+ TV-Modell</button>
+<div class="card"><b>Updates</b>
+<p class="mut">Installiert: Version <span id="ver">?</span>. Der Stick holt sich Updates selbst von GitHub. Dafür hier einmal dein WLAN eintragen, z.B. den iPhone-Hotspot (am iPhone <i>Maximale Kompatibilität</i> einschalten). Danach am Stick <b>Update</b> wählen.</p>
+<p class="mut" id="updnow"></p>
+<input id="us" placeholder="WLAN-Name (z.B. iPhone von ...)" autocapitalize="none" autocorrect="off" style="width:100%;box-sizing:border-box;padding:9px;margin:4px 0;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)">
+<input id="up" type="password" placeholder="Passwort" style="width:100%;box-sizing:border-box;padding:9px;margin:4px 0 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)">
+<button class="p" onclick="saveWifi()">WLAN speichern</button></div>
+<p class="mut">Aufnehmen: Original-Fernbedienung aus ca. 20-30 cm auf die Oberseite des StickS3 richten und die Tasten in Ruhe nacheinander drücken. Die Pausen werden mit aufgenommen und beim Abspielen genauso wiederholt.</p>
+</main>
+<script>
+let D=null,last='';
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(p,a){let ok=false;try{const r=await fetch('/api/'+p+'?'+new URLSearchParams(a||{}),{method:'POST'});ok=r.ok;if(!r.ok)alert(await r.text())}catch(e){alert('Keine Verbindung zum Stick')}last='';await load();return ok}
+const sec=ms=>(ms/1000).toFixed(1)+' s';
+function render(){
+ const st=$('#st'),busy=D.rec.on||D.play.on;
+ if(D.rec.on){st.style.display='block';st.innerHTML='<b>Aufnahme: '+esc(D.rec.name)+'</b><br>'+D.rec.n+' Signale empfangen<br><br><button class="p" onclick="api(\'recdone\')">Fertig &amp; speichern</button> <button onclick="api(\'recabort\')">Abbrechen</button>'}
+ else if(D.play.on){st.style.display='block';st.innerHTML='<b>Spielt ab: '+esc(D.play.name)+'</b><br>Signal '+D.play.step+' / '+D.play.total+'<br><br><button class="d" onclick="api(\'stop\')">Stopp</button>'}
+ else st.style.display='none';
+ $('#ver').textContent=D.ver;$('#updnow').textContent=D.updssid?'Gespeichertes WLAN: '+D.updssid:'Noch kein WLAN für Updates gespeichert.';if(!$('#us').value&&D.updssid&&document.activeElement!==$('#us'))$('#us').value=D.updssid;
+ const dis=busy?' disabled':'';
+ $('#tvs').innerHTML=D.tvs.length?D.tvs.map((t,i)=>'<div class="card"><h2><span class="grow">'+esc(t.n)+'</span><button onclick="ren('+i+',-1)"'+dis+'>Umbenennen</button><button class="d" onclick="del('+i+',-1)"'+dis+'>Löschen</button></h2>'+
+  t.m.map((m,j)=>'<div class="row"><button class="p" onclick="api(\'play\',{tv:'+i+',m:'+j+'})"'+dis+'>&#9654;</button><div class="grow">'+esc(m.n)+'<br><span class="mut">'+m.s+' Signale &middot; '+sec(m.d)+'</span></div>'+
+   (j?'<button title="nach oben" onclick="api(\'move\',{tv:'+i+',m:'+j+'})"'+dis+'>&uarr;</button>':'')+
+   '<button title="umbenennen" onclick="ren('+i+','+j+')"'+dis+'>&#9998;</button><button title="neu aufnehmen" onclick="rec('+i+','+j+')"'+dis+'>&#9679;</button><button class="d" title="löschen" onclick="del('+i+','+j+')"'+dis+'>&#10005;</button></div>').join('')+
+  '<div class="row"><button onclick="rec('+i+',-1)"'+dis+'>&#9679; Neues Makro aufnehmen</button></div></div>').join(''):'<p class="mut">Noch kein TV-Modell angelegt.</p>';
+}
+function saveWifi(){const s=$('#us').value.trim(),p=$('#up').value;if(!s)return alert('Bitte den WLAN-Namen eintragen.');
+ const a={s:s,p:p};if(!p&&D.updssid===s&&confirm('Passwort leer lassen = bisheriges Passwort behalten?'))a.keep=1;
+ api('updwifi',a).then(ok=>{if(!ok)return;$('#up').value='';alert('Gespeichert. Jetzt am Stick "Update" wählen, wenn der Hotspot an ist.')})}
+function ren(i,j){const o=j<0?D.tvs[i].n:D.tvs[i].m[j].n,n=prompt('Neuer Name:',o);if(n&&n.trim())api('rename',{tv:i,m:j,name:n.trim()})}
+function del(i,j){const n=j<0?'TV-Modell "'+D.tvs[i].n+'" mit allen Makros':'Makro "'+D.tvs[i].m[j].n+'"';if(confirm(n+' wirklich löschen?'))api('del',{tv:i,m:j})}
+function rec(i,j){let n;if(j<0){n=prompt('Name für das neue Makro:','Makro '+(D.tvs[i].m.length+1));if(!n||!n.trim())return}else{if(!confirm('Makro "'+D.tvs[i].m[j].n+'" neu aufnehmen (die alte Aufnahme wird ersetzt)?'))return;n=D.tvs[i].m[j].n}api('rec',{tv:i,m:j,name:n.trim()})}
+function addTv(){const n=prompt('Name des TV-Modells (z.B. Samsung UE55):');if(n&&n.trim())api('addtv',{name:n.trim()})}
+async function load(){try{const r=await fetch('/api/data'),t=await r.text();if(t!==last){last=t;D=JSON.parse(t);render()}}catch(e){}}
+load();setInterval(load,1000);
+</script></body></html>
