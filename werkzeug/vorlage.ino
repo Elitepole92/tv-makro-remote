@@ -16,20 +16,22 @@
 //   2. Bibliotheksverwalter: "M5Unified" installieren
 //   3. Board "M5StickS3" waehlen, Port waehlen, Hochladen.
 //
-// Bedienung am Stick:
-//   Taste B (Seite)  kurz : naechster Eintrag     lang : vorheriger Eintrag
-//   Taste A (Front)  kurz : Auswaehlen / Abspielen
-//   Taste A (Front)  lang : Optionen (neu aufnehmen, loeschen)
+// Bedienung am Stick (hochkant):
+//   Taste A (vorne)   kurz : Auswaehlen / Abspielen     lang : Optionen (neu aufnehmen, loeschen)
+//   Taste B (Seite)   kurz : naechster Eintrag          lang : Menue (WLAN, Update, Ausschalten)
+//   Power-Taste       kurz : ganz aus (bleibt aus, bis man Power wieder drueckt)
+//
+// Strom sparen: nach 10 s wird das Display dunkler, nach 30 s schlaeft der Stick
+// tief (Display aus, Prozessor aus). Taste A oder B weckt ihn - der erste Druck
+// weckt nur, er steht dann wieder beim zuletzt benutzten Makro.
 //
 // Updates ohne Laptop (holt sich der Stick selbst von GitHub):
-//   1. Einmalig: am Stick "WLAN / Browser" -> am iPhone ins WLAN "TV-Remote-xxxx"
+//   1. Einmalig: am Stick B lang -> "WLAN / Browser" -> am iPhone ins WLAN "TV-Remote-xxxx"
 //      -> im Browser 192.168.4.1 -> unten bei "Updates" den iPhone-Hotspot eintragen.
 //   2. Spaeter: iPhone-Hotspot an (Einstellungen -> Persoenlicher Hotspot,
-//      "Maximale Kompatibilitaet" an) -> am Stick "Update" waehlen.
+//      "Maximale Kompatibilitaet" an) -> am Stick B lang -> "Update".
 //      Er laedt die neueste Version von GitHub und startet neu.
 //   Makros und TV-Modelle bleiben dabei erhalten.
-//
-// Display geht nach 30 s ohne Bedienung aus; erster Tastendruck weckt es nur auf.
 //
 // Aufnehmen:
 //   TV-Modell oeffnen -> "Neues Makro aufnehmen" -> Original-Fernbedienung aus
@@ -42,6 +44,7 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <esp_ota_ops.h>
+#include <esp_sleep.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
@@ -82,7 +85,15 @@ static constexpr size_t MAX_MACROS = 30;           // pro TV-Modell
 static constexpr size_t MAX_STEPS = 400;           // IR-Signale pro Makro
 static constexpr size_t MAX_TOTAL_BYTES = 120000;  // Gesamtspeicher fuer alle Makros
 static constexpr uint32_t MAX_GAP_MS = 30000;      // laengere Pausen werden gekuerzt
-static constexpr uint32_t DISPLAY_OFF_MS = 30000;  // Display aus nach 30 s ohne Bedienung
+static constexpr uint32_t DISPLAY_DIM_MS = 10000;  // Display dunkler nach 10 s
+static constexpr uint32_t DISPLAY_OFF_MS = 30000;  // nach 30 s: Display aus + Tiefschlaf
+static constexpr uint32_t AP_IDLE_MS = 300000;     // Stick-WLAN geht aus, wenn 5 min niemand verbunden ist
+static constexpr uint8_t BRIGHT_ON = 110;          // Helligkeit (0-255): weniger = laenger Akku
+static constexpr uint8_t BRIGHT_DIM = 20;
+static constexpr int PIN_BTN_A = 11;               // Tasten des StickS3 (wecken aus dem Tiefschlaf)
+static constexpr int PIN_BTN_B = 12;
+static constexpr uint32_t CPU_MHZ = 80;            // reicht fuer IR + Anzeige, spart Strom
+static constexpr const char *COPYRIGHT = "(c) 2026 Daniel Lassak";
 // Hier holt sich der Stick Updates (GitHub-Release: firmware.bin + version.txt)
 static constexpr const char *UPDATE_URL = "https://github.com/Elitepole92/tv-makro-remote/releases/latest/download/";
 
@@ -129,7 +140,7 @@ struct Reader {
   bool ok;
 };
 
-enum class Screen : uint8_t { Tvs, Macros, Options, Confirm, Recording, Playing, Wifi, Update };
+enum class Screen : uint8_t { Tvs, Macros, Options, Confirm, Recording, Playing, Wifi, Update, Menu };
 
 // Vorwaertsdeklarationen (Web <-> Bedienung)
 namespace web {
@@ -585,6 +596,10 @@ uint32_t flashUntil = 0;
 uint32_t lastInput = 0;
 uint32_t lastDraw = 0;
 bool displayOff = false;
+bool dimmed = false;
+bool waitRelease = false;  // nach dem Aufwachen: weckende Taste ignorieren, bis losgelassen
+Screen menuBack = Screen::Tvs;  // von hier wurde das Menue geoeffnet
+size_t menuBackCursor = 0;
 
 // Update von GitHub
 bool updating = false;
@@ -610,10 +625,11 @@ void wake() {
   lastInput = millis();
   if (displayOff) {
     M5.Display.wakeup();
-    M5.Display.setBrightness(160);
     displayOff = false;
     lastDraw = 0;  // sofort neu zeichnen
   }
+  dimmed = false;
+  M5.Display.setBrightness(BRIGHT_ON);
 }
 
 // Umlaute fuer die Display-Schrift umschreiben
@@ -803,13 +819,60 @@ void loopPlay() {
   }
 }
 
+// ------------------------------------------------------------ Strom sparen
+// IMU schlafen legen - nur wenn die M5Unified-Version das kann (sonst passiert nichts)
+template <class T>
+auto imuSleep(T &i, int) -> decltype(i.sleep(), void()) {
+  i.sleep();
+}
+template <class T>
+void imuSleep(T &, long) {}
+
+// Tiefschlaf: Prozessor, Display und Funk aus. Taste A oder B startet ihn neu,
+// er steht dann wieder beim zuletzt benutzten Makro (alles ist im Flash gespeichert).
+void deepSleep() {
+  if (selDirty) {
+    selDirty = false;
+    store::save();
+  }
+  web::stop();
+  ir::stopReceive();
+  M5.Display.setBrightness(0);
+  M5.Display.sleep();
+  imuSleep(M5.Imu, 0);
+  M5.Power.setExtOutput(false);  // IR-LED-Versorgung aus
+  // Ruhepegel der Tasten jetzt lesen (keine gedrueckt) und auf die Gegenrichtung wecken
+  int idleA = digitalRead(PIN_BTN_A), idleB = digitalRead(PIN_BTN_B);
+  uint64_t mask = (1ULL << PIN_BTN_A) | (idleA == idleB ? (1ULL << PIN_BTN_B) : 0);
+  esp_sleep_enable_ext1_wakeup(mask, idleA ? ESP_EXT1_WAKEUP_ANY_LOW : ESP_EXT1_WAKEUP_ANY_HIGH);
+  esp_deep_sleep_start();
+}
+
+// Power-Taste: ganz aus. Einschalten wieder mit der Power-Taste.
+// Haengt er am USB-Kabel, laesst sich der Stick nicht ganz abschalten -> Tiefschlaf.
+void powerOff() {
+  if (recording) finishRecord(false);
+  if (playing) stopPlay("Aus");
+  if (selDirty) {
+    selDirty = false;
+    store::save();
+  }
+  web::stop();
+  M5.Display.setBrightness(0);
+  M5.Display.sleep();
+  M5.Power.powerOff();
+  delay(500);
+  deepSleep();
+}
+
 // ------------------------------------------------------------------ Listen
 size_t itemCount() {
   switch (screen) {
-    case Screen::Tvs: return store::tvs.size() + 3;
+    case Screen::Tvs: return store::tvs.size() + 1;
     case Screen::Macros: return store::tvs[store::selTv].macros.size() + 2;
     case Screen::Options: return optForMacro ? 4 : 2;
     case Screen::Confirm: return 2;
+    case Screen::Menu: return 4;
     default: return 0;
   }
 }
@@ -819,14 +882,12 @@ String itemText(size_t i) {
     case Screen::Tvs: {
       size_t n = store::tvs.size();
       if (i < n) return store::tvs[i].name;
-      if (i == n) return "+ Neues TV-Modell";
-      if (i == n + 1) return store::wifiOn ? "WLAN: an (Infos)" : "WLAN / Browser";
-      return String("Update  (") + FW_NAME + ")";
+      return "+ Neues TV";
     }
     case Screen::Macros: {
       const auto &ms = store::tvs[store::selTv].macros;
       if (i < ms.size()) return ms[i].name;
-      if (i == ms.size()) return "* Neues Makro aufnehmen";
+      if (i == ms.size()) return "* Aufnehmen";
       return "< Zurueck";
     }
     case Screen::Options:
@@ -834,11 +895,16 @@ String itemText(size_t i) {
         const char *o[] = {"Abspielen", "Neu aufnehmen", "Loeschen", "< Zurueck"};
         return o[i];
       } else {
-        const char *o[] = {"Loeschen (mit Makros)", "< Zurueck"};
+        const char *o[] = {"Loeschen", "< Zurueck"};
         return o[i];
       }
     case Screen::Confirm: {
       const char *o[] = {"Nein", "Ja, loeschen"};
+      return o[i];
+    }
+    case Screen::Menu: {
+      if (i == 0) return web::isRunning() ? "WLAN: an" : "WLAN/Browser";
+      const char *o[] = {"", "Update", "Ausschalten", "< Zurueck"};
       return o[i];
     }
     default: return "";
@@ -852,16 +918,19 @@ String title() {
     case Screen::Options:
     case Screen::Confirm:
       return optForMacro ? store::tvs[optTv].macros[optMacro].name : store::tvs[optTv].name;
+    case Screen::Menu: return "Menue";
     default: return "";
   }
 }
 
-const char *hint() {
+// Zwei Hinweiszeilen unten
+void hints(const char *&l1, const char *&l2) {
   switch (screen) {
-    case Screen::Tvs: return "A: Oeffnen  B: Weiter  A lang: Opt.";
-    case Screen::Macros: return "A: Abspielen  B: Weiter  A lang: Opt.";
-    case Screen::Confirm: return "Wirklich loeschen?";
-    default: return "A: Auswahl  B: Weiter";
+    case Screen::Tvs: l1 = "A Oeffnen  B Weiter"; l2 = "B lang: Menue"; break;
+    case Screen::Macros: l1 = "A Start  B Weiter"; l2 = "A lang: Optionen"; break;
+    case Screen::Confirm: l1 = "Wirklich loeschen?"; l2 = "A Auswahl  B Weiter"; break;
+    case Screen::Menu: l1 = "A Auswahl  B Weiter"; l2 = "B lang: Zurueck"; break;
+    default: l1 = "A Auswahl  B Weiter"; l2 = ""; break;
   }
 }
 
@@ -870,11 +939,27 @@ void backToList() {
   cursor = optForMacro ? optMacro : optTv;
 }
 
+void openMenu() {
+  menuBack = screen;
+  menuBackCursor = cursor;
+  screen = Screen::Menu;
+  cursor = 0;
+}
+
+void closeMenu() {
+  screen = menuBack;
+  cursor = menuBackCursor;
+  if (screen == Screen::Macros && store::tvs.empty()) screen = Screen::Tvs;
+  if (screen != Screen::Tvs && screen != Screen::Macros) screen = Screen::Tvs;
+  if (cursor >= itemCount()) cursor = 0;
+}
+
 // Nach Aenderungen ueber das Web: Anzeige in einen gueltigen Zustand bringen
 void afterExternalChange() {
   store::clampSelection();
   if (screen == Screen::Options || screen == Screen::Confirm) screen = Screen::Tvs;
   if (screen == Screen::Macros && store::tvs.empty()) screen = Screen::Tvs;
+  if (menuBack == Screen::Macros && store::tvs.empty()) menuBack = Screen::Tvs;
   if (cursor >= itemCount()) cursor = 0;
 }
 
@@ -891,7 +976,7 @@ void activate(size_t i) {
         }
         screen = Screen::Macros;
         cursor = store::selMacro;
-      } else if (i == n) {
+      } else {
         if (n >= MAX_TVS) {
           flash("Maximal " + String(MAX_TVS) + " TV-Modelle");
           return;
@@ -899,16 +984,7 @@ void activate(size_t i) {
         store::tvs.push_back({String("TV ") + String(n + 1), {}});
         store::save();
         cursor = n;
-        flash("Angelegt (Name im Browser aenderbar)", 3500);
-      } else if (i == n + 2) {
-        doUpdate();
-      } else {
-        if (!store::wifiOn) {
-          store::wifiOn = true;
-          web::start();
-          store::save();
-        }
-        screen = Screen::Wifi;
+        flash("Angelegt. Name im Browser aenderbar", 3500);
       }
       break;
     }
@@ -966,6 +1042,18 @@ void activate(size_t i) {
       }
       backToList();
       break;
+    case Screen::Menu:
+      if (i == 0) {
+        web::start();
+        screen = Screen::Wifi;
+      } else if (i == 1) {
+        doUpdate();
+      } else if (i == 2) {
+        powerOff();
+      } else {
+        closeMenu();
+      }
+      break;
     default: break;
   }
 }
@@ -986,142 +1074,192 @@ void hold(size_t i) {
 }
 
 // ------------------------------------------------------------------ Zeichnen
+// Hochkant: 135 x 240 Pixel
+constexpr int ROW_Y = 26;  // erste Listenzeile
+constexpr int ROW_H = 28;
+constexpr int ROWS = 6;    // sichtbare Zeilen
+constexpr int FOOT_Y = 204;
+
 void header(const String &t, uint16_t col) {
-  canvas.fillRect(0, 0, canvas.width(), 20, col);
+  int w = canvas.width();
+  canvas.fillRect(0, 0, w, 22, col);
   canvas.setTextColor(TFT_WHITE);
   canvas.setFont(&fonts::Font2);
   int bat = M5.Power.getBatteryLevel();
-  int right = canvas.width() - 4;
+  int right = w - 3;
   if (bat >= 0) {
     canvas.setTextDatum(middle_right);
-    canvas.drawString(String(bat) + "%", right, 10);
-    right -= canvas.textWidth("100%") + 6;
+    String b = String(bat) + "%";
+    canvas.drawString(b, right, 11);
+    right -= canvas.textWidth(b) + 4;
   }
   canvas.setFont(&fonts::FreeSansBold9pt7b);
   canvas.setTextDatum(middle_left);
-  canvas.drawString(fit(t, right - 4), 4, 10);
+  canvas.drawString(fit(t, right - 4), 3, 11);
 }
 
-void footer(const char *text, uint16_t col) {
+// Text auf mehrere Zeilen umbrechen (aktuelle Schrift), liefert die naechste freie y-Position
+int wrapText(const String &text, int x, int y, int w, int lineH, int maxLines, bool center) {
+  String t = ascii(text) + " ";
+  String line, word;
+  int lines = 0;
+  canvas.setTextDatum(center ? top_center : top_left);
+  int cx = center ? x + w / 2 : x;
+  for (size_t i = 0; i < t.length() && lines < maxLines; i++) {
+    char c = t[i];
+    if (c != ' ') {
+      word += c;
+      continue;
+    }
+    String test = line.length() ? line + " " + word : word;
+    if (canvas.textWidth(test) > w && line.length()) {
+      canvas.drawString(line, cx, y);
+      y += lineH;
+      lines++;
+      line = word;
+    } else {
+      line = test;
+    }
+    word = "";
+  }
+  if (line.length() && lines < maxLines) {
+    canvas.drawString(fit(line, w), cx, y);
+    y += lineH;
+  }
+  return y;
+}
+
+void footer(const char *l1, const char *l2, uint16_t col) {
+  int w = canvas.width();
   canvas.setFont(&fonts::Font2);
-  canvas.setTextDatum(top_left);
   if (millis() < flashUntil) {
     canvas.setTextColor(COL_WARN);
-    canvas.drawString(fit(flashMsg, canvas.width() - 8), 4, canvas.height() - 18);
-  } else {
-    canvas.setTextColor(col);
-    canvas.drawString(text, 4, canvas.height() - 18);
+    wrapText(flashMsg, 2, FOOT_Y, w - 4, 17, 2, true);
+    return;
   }
+  canvas.setTextColor(col);
+  canvas.setTextDatum(top_center);
+  canvas.drawString(fit(l1, w - 4), w / 2, FOOT_Y);
+  canvas.drawString(fit(l2, w - 4), w / 2, FOOT_Y + 17);
 }
 
 void drawList() {
+  int w = canvas.width();
   header(title(), screen == Screen::Confirm ? COL_REC : COL_ACC);
   size_t n = itemCount();
   if (cursor >= n) cursor = 0;
-  const int rowH = 23, rows = 4;
+  int rows = screen == Screen::Menu ? 4 : ROWS;
   size_t first = cursor >= (size_t)rows ? cursor - rows + 1 : 0;
   canvas.setFont(&fonts::FreeSans9pt7b);
   canvas.setTextDatum(middle_left);
   for (int r = 0; r < rows && first + r < n; r++) {
     size_t i = first + r;
-    int y = 22 + r * rowH;
+    int y = ROW_Y + r * ROW_H;
     if (i == cursor) {
-      canvas.fillRoundRect(2, y + 1, canvas.width() - 4, rowH - 2, 4, COL_SEL);
+      canvas.fillRoundRect(2, y + 1, w - 6, ROW_H - 3, 5, COL_SEL);
       canvas.setTextColor(TFT_WHITE);
     } else {
       canvas.setTextColor(COL_MUT);
     }
-    canvas.drawString(fit(itemText(i), canvas.width() - 16), 8, y + rowH / 2);
+    canvas.drawString(fit(itemText(i), w - 16), 7, y + ROW_H / 2);
   }
-  // Scroll-Hinweis
-  if (n > (size_t)rows) {
-    int h = 4 * rowH;
+  if (n > (size_t)rows) {  // Scrollbalken
+    int h = rows * ROW_H;
     int bh = h * rows / n;
-    int by = 22 + (h - bh) * first / (n - rows);
-    canvas.fillRect(canvas.width() - 3, by, 2, bh, COL_MUT);
+    int by = ROW_Y + (h - bh) * first / (n - rows);
+    canvas.fillRect(w - 3, by, 2, bh, COL_MUT);
   }
-  footer(hint(), COL_MUT);
+  if (screen == Screen::Menu) {  // Copyright + Version
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(COL_MUT);
+    canvas.drawString(COPYRIGHT, w / 2, 150);
+    canvas.drawString(String("Version ") + FW_NAME, w / 2, 164);
+  }
+  const char *l1, *l2;
+  hints(l1, l2);
+  footer(l1, l2, COL_MUT);
 }
 
 void drawRecording() {
-  header("Aufnahme: " + recName, COL_REC);
-  canvas.setTextDatum(top_left);
-  canvas.setFont(&fonts::FreeSansBold18pt7b);
-  bool fresh = recLastSignalMs && millis() - recLastSignalMs < 400;
-  canvas.setTextColor(fresh ? COL_OK : TFT_WHITE);
-  canvas.drawString(String(recSteps.size()), 8, 28);
-  int w = canvas.textWidth(String(recSteps.size()));
-  canvas.setFont(&fonts::FreeSans9pt7b);
-  canvas.setTextColor(COL_MUT);
-  canvas.drawString(recSteps.size() == 1 ? "Signal" : "Signale", 16 + w, 40);
-  uint32_t secs = (millis() - recStartMs) / 1000;
-  canvas.drawString(String(secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + String(secs % 60), canvas.width() - 50, 40);
-  canvas.setFont(&fonts::Font2);
+  int w = canvas.width();
+  header("Aufnahme", COL_REC);
+  canvas.setFont(&fonts::FreeSansBold9pt7b);
   canvas.setTextColor(TFT_WHITE);
-  if (recSteps.empty()) {
-    canvas.drawString("Original-FB auf die Oberseite", 8, 74);
-    canvas.drawString("richten und Tasten druecken", 8, 92);
-  } else {
-    canvas.drawString("Weitere Tasten druecken ...", 8, 74);
-    canvas.drawString("Pausen werden mit aufgenommen", 8, 92);
-  }
-  footer("A: Fertig    B: Abbrechen", COL_MUT);
+  canvas.setTextDatum(top_center);
+  canvas.drawString(fit(recName, w - 8), w / 2, 30);
+  bool fresh = recLastSignalMs && millis() - recLastSignalMs < 400;
+  canvas.setFont(&fonts::FreeSansBold24pt7b);
+  canvas.setTextColor(fresh ? COL_OK : TFT_WHITE);
+  canvas.drawString(String(recSteps.size()), w / 2, 58);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextColor(COL_MUT);
+  canvas.drawString(recSteps.size() == 1 ? "Signal" : "Signale", w / 2, 102);
+  uint32_t secs = (millis() - recStartMs) / 1000;
+  canvas.drawString(String(secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + String(secs % 60), w / 2, 120);
+  canvas.setTextColor(TFT_WHITE);
+  if (recSteps.empty()) wrapText("Original-FB auf die Oberseite richten und Tasten druecken", 4, 146, w - 8, 17, 3, true);
+  else wrapText("Weitere Tasten druecken. Pausen werden mit aufgenommen.", 4, 146, w - 8, 17, 3, true);
+  footer("A: Fertig", "B: Abbrechen", COL_MUT);
 }
 
 void drawPlaying() {
+  int w = canvas.width();
   const auto &m = store::tvs[playTv].macros[playMacro];
   header("Abspielen", COL_OK);
   canvas.setFont(&fonts::FreeSansBold9pt7b);
-  canvas.setTextDatum(top_left);
   canvas.setTextColor(TFT_WHITE);
-  canvas.drawString(fit(m.name, canvas.width() - 16), 8, 30);
+  int y = wrapText(m.name, 4, 32, w - 8, 20, 2, true);
   canvas.setFont(&fonts::Font2);
   canvas.setTextColor(COL_MUT);
-  canvas.drawString(fit(store::tvs[playTv].name, canvas.width() - 16), 8, 52);
-  canvas.drawString("Signal " + String(playIdx) + " / " + String(m.steps.size()), 8, 72);
+  canvas.setTextDatum(top_center);
+  canvas.drawString(fit(store::tvs[playTv].name, w - 8), w / 2, y + 4);
+  canvas.drawString("Signal " + String(playIdx) + " / " + String(m.steps.size()), w / 2, 110);
+  int bw = w - 16;
+  canvas.drawRect(8, 132, bw, 12, COL_MUT);
+  canvas.fillRect(9, 133, (bw - 2) * playIdx / m.steps.size(), 10, COL_OK);
   uint32_t total = m.steps.back().at;
   uint32_t el = millis() - playT0;
   uint32_t left = el < total ? (total - el + 999) / 1000 : 0;
-  canvas.setTextDatum(top_right);
-  canvas.drawString("noch " + String(left) + " s", canvas.width() - 8, 72);
-  int w = canvas.width() - 16;
-  canvas.drawRect(8, 94, w, 10, COL_MUT);
-  canvas.fillRect(9, 95, (w - 2) * playIdx / m.steps.size(), 8, COL_OK);
-  footer("A / B: Stopp", COL_MUT);
+  canvas.drawString("noch " + String(left) + " s", w / 2, 152);
+  footer("A / B: Stopp", "", COL_MUT);
 }
 
 void drawWifi() {
-  header("WLAN / Browser", COL_ACC);
+  int w = canvas.width();
+  header("WLAN", COL_ACC);
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(top_left);
-  canvas.setTextColor(TFT_WHITE);
-  canvas.drawString("WLAN:  " + web::ssid(), 8, 28);
-  canvas.drawString("Passwort:  " + String(AP_PASS), 8, 48);
-  canvas.drawString("Browser:  http://192.168.4.1", 8, 68);
+  const char *lab[] = {"WLAN-Name:", "Passwort:", "Im Browser:"};
+  String val[] = {web::ssid(), AP_PASS, "192.168.4.1"};
+  for (int i = 0; i < 3; i++) {
+    canvas.setTextColor(COL_MUT);
+    canvas.drawString(lab[i], 6, 30 + i * 42);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.drawString(fit(val[i], w - 12), 6, 48 + i * 42);
+  }
   canvas.setTextColor(COL_MUT);
-  canvas.drawString(String("Version ") + FW_NAME + "   Updates: im Browser", 8, 90);
-  footer("A: Zurueck   A lang: WLAN aus", COL_MUT);
+  wrapText("Umbenennen, Sortieren, Update-WLAN", 4, 160, w - 8, 17, 2, true);
+  footer("A: Zurueck", "A lang: WLAN aus", COL_MUT);
 }
 
 void drawUpdate() {
+  int w = canvas.width();
   header("Update", COL_WARN);
-  canvas.setFont(&fonts::FreeSans9pt7b);
-  canvas.setTextDatum(top_left);
-  canvas.setTextColor(TFT_WHITE);
-  canvas.drawString(fit(updMsg, canvas.width() - 16), 8, 30);
   canvas.setFont(&fonts::Font2);
+  canvas.setTextColor(TFT_WHITE);
+  wrapText(updMsg, 4, 32, w - 8, 18, 3, true);
   canvas.setTextColor(COL_MUT);
-  canvas.drawString(String("Installiert: ") + FW_NAME, 8, 54);
+  canvas.setTextDatum(top_center);
+  canvas.drawString(String("Installiert: ") + FW_NAME, w / 2, 96);
   if (updPct >= 0) {
-    canvas.setTextDatum(top_right);
-    canvas.drawString(String(updPct) + " %", canvas.width() - 8, 54);
-    int w = canvas.width() - 16;
-    canvas.drawRect(8, 76, w, 12, COL_MUT);
-    canvas.fillRect(9, 77, (w - 2) * updPct / 100, 10, COL_OK);
+    canvas.drawString(String(updPct) + " %", w / 2, 122);
+    int bw = w - 16;
+    canvas.drawRect(8, 142, bw, 12, COL_MUT);
+    canvas.fillRect(9, 143, (bw - 2) * updPct / 100, 10, COL_OK);
   }
-  canvas.setTextDatum(top_left);
   canvas.setTextColor(COL_WARN);
-  canvas.drawString(updPct >= 0 ? "Nicht ausschalten!" : "B: Abbrechen", 4, canvas.height() - 18);
+  canvas.drawString(updPct >= 0 ? "Nicht ausschalten!" : "B: Abbrechen", w / 2, FOOT_Y + 8);
 }
 
 void draw() {
@@ -1135,9 +1273,9 @@ void draw() {
   }
   if (!irOk || !storeOk) {
     canvas.setFont(&fonts::Font2);
-    canvas.setTextDatum(top_right);
+    canvas.setTextDatum(top_center);
     canvas.setTextColor(COL_REC);
-    canvas.drawString(!irOk ? "IR-Fehler" : "Speicherfehler", canvas.width() - 4, 22);
+    canvas.drawString(!irOk ? "IR-Fehler" : "Speicherfehler", canvas.width() / 2, 186);
   }
   canvas.pushSprite(0, 0);
 }
@@ -1164,6 +1302,7 @@ void doUpdate() {
   }
   bool hadAp = web::isRunning();
   web::stop();
+  setCpuFrequencyMhz(240);  // fuer die verschluesselte Verbindung schneller
   updating = true;
   screen = Screen::Update;
   wake();
@@ -1233,28 +1372,37 @@ void doUpdate() {
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  setCpuFrequencyMhz(CPU_MHZ);
   updating = false;
   updPct = -1;
   if (hadAp) web::start();
-  screen = Screen::Tvs;
-  cursor = store::tvs.size() + 2;
+  screen = Screen::Menu;
+  cursor = 1;
   flash(result, 6000);
   wake();
 }
 
 // ------------------------------------------------------------------ Ablauf
+uint32_t bootMs = 0;
+
 void begin() {
   esp_ota_mark_app_valid_cancel_rollback();  // diese Version laeuft: behalten
+  setCpuFrequencyMhz(CPU_MHZ);
   WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);  // Funk aus, bis er gebraucht wird
+  bootMs = millis();
+  // Von Taste A/B aus dem Tiefschlaf geweckt: diesen Druck nicht als Bedienung werten
+  waitRelease = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
   canvas.setColorDepth(16);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
   storeOk = store::begin();
+  store::wifiOn = false;  // Stick-WLAN startet nie von selbst (Strom)
   irOk = ir::begin();
-  if (store::wifiOn) web::start();
   screen = Screen::Macros;  // direkt beim zuletzt benutzten TV-Modell starten
   if (store::tvs.empty()) screen = Screen::Tvs;
   cursor = store::selMacro;
   lastInput = millis();
+  M5.Display.setBrightness(BRIGHT_ON);
   draw();
 }
 
@@ -1264,10 +1412,19 @@ void loop() {
 
   bool aClick = M5.BtnA.wasClicked(), aHold = M5.BtnA.wasHold();
   bool bClick = M5.BtnB.wasClicked(), bHold = M5.BtnB.wasHold();
-  bool any = aClick || aHold || bClick || bHold;
+  bool pwr = M5.BtnPWR.wasClicked();
 
+  if (waitRelease) {  // weckende Taste nach dem Tiefschlaf ignorieren
+    if (!M5.BtnA.isPressed() && !M5.BtnB.isPressed()) waitRelease = false;
+    aClick = aHold = bClick = bHold = false;
+  }
+  if (millis() - bootMs < 3000) pwr = false;  // Einschalt-Druck der Power-Taste nicht als "aus" werten
+
+  if (pwr) powerOff();
+
+  bool any = aClick || aHold || bClick || bHold;
   if (any && displayOff) {
-    wake();  // erster Tastendruck weckt nur das Display
+    wake();  // Display war aus: erster Druck weckt nur
   } else if (any) {
     wake();
     switch (screen) {
@@ -1280,22 +1437,23 @@ void loop() {
         break;
       case Screen::Wifi:
         if (aClick) {
-          screen = Screen::Tvs;
-          cursor = store::tvs.size() + 1;
+          screen = Screen::Menu;
+          cursor = 0;
         }
         if (aHold) {
           web::stop();
-          store::wifiOn = false;
-          store::save();
-          screen = Screen::Tvs;
-          cursor = store::tvs.size() + 1;
+          screen = Screen::Menu;
+          cursor = 0;
           flash("WLAN aus");
         }
         break;
       default: {
         size_t n = itemCount();
         if (bClick && n) cursor = (cursor + 1) % n;
-        if (bHold && n) cursor = (cursor + n - 1) % n;
+        if (bHold) {
+          if (screen == Screen::Menu) closeMenu();
+          else if (screen == Screen::Tvs || screen == Screen::Macros) openMenu();
+        }
         if (aClick) activate(cursor);
         if (aHold) hold(cursor);
         break;
@@ -1312,18 +1470,27 @@ void loop() {
     store::save();
   }
 
+  // Strom sparen: 10 s dunkler, 30 s Tiefschlaf (mit Stick-WLAN an: nur Display aus)
   if (busy()) lastInput = millis();
-  if (!displayOff && millis() - lastInput > DISPLAY_OFF_MS) {
-    M5.Display.setBrightness(0);
-    M5.Display.sleep();
-    displayOff = true;
+  uint32_t idle = millis() - lastInput;
+  if (!displayOff && !dimmed && idle > DISPLAY_DIM_MS) {
+    M5.Display.setBrightness(BRIGHT_DIM);
+    dimmed = true;
+  }
+  if (idle > DISPLAY_OFF_MS) {
+    if (!web::isRunning() && !M5.BtnA.isPressed() && !M5.BtnB.isPressed()) deepSleep();
+    if (!displayOff) {
+      M5.Display.setBrightness(0);
+      M5.Display.sleep();
+      displayOff = true;
+    }
   }
 
-  if (!displayOff && millis() - lastDraw > (recording || playing ? 50u : 100u)) {
+  if (!displayOff && millis() - lastDraw > (recording || playing ? 50u : 150u)) {
     lastDraw = millis();
     draw();
   }
-  delay(recording ? 1 : 5);
+  delay(recording ? 1 : (displayOff ? 30 : 10));  // Pausen: der Prozessor ruht dazwischen
 }
 
 }  // namespace app
@@ -1337,6 +1504,7 @@ namespace web {
 WebServer server(80);
 bool running = false;
 bool routesDone = false;
+uint32_t lastClientMs = 0;
 
 String ssid() {
   uint8_t mac[6] = {0};
@@ -1573,6 +1741,7 @@ void start() {
   }
   server.begin();
   running = true;
+  lastClientMs = millis();
 }
 
 void stop() {
@@ -1586,6 +1755,9 @@ void stop() {
 void loop() {
   if (!running) return;
   server.handleClient();
+  // Stromsparen: Stick-WLAN aus, wenn 5 min niemand verbunden war
+  if (WiFi.softAPgetStationNum() > 0) lastClientMs = millis();
+  else if (millis() - lastClientMs > AP_IDLE_MS) stop();
 
 }
 
@@ -1599,8 +1771,8 @@ void setup() {
   M5.begin(cfg);
   M5.Speaker.end();             // Verstaerker aus, sonst stoert er den IR-Empfang
   M5.Power.setExtOutput(true);  // Versorgung fuer die IR-LED
-  M5.Display.setRotation(1);    // Querformat 240 x 135
-  M5.Display.setBrightness(160);
+  M5.Mic.end();                 // Mikrofon wird nicht gebraucht
+  M5.Display.setRotation(0);    // hochkant 135 x 240 (steht es auf dem Kopf: 2 eintragen)
   app::begin();
 }
 
