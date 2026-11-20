@@ -48,6 +48,7 @@
 #include <M5Unified.h>
 #include <esp_ota_ops.h>
 #include <esp_sleep.h>
+#include <soc/gpio_reg.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
@@ -266,6 +267,10 @@ static void arm(int buf) {
   rmt_receive(rxChan, rxBuf[buf], rxSymbols * sizeof(rmt_symbol_word_t), &rc);
 }
 
+// Rohsegmente (Pegel + Dauer) des zuletzt empfangenen Telegramms, auch fuers Log
+uint8_t segLevel[2 * RX_MAX];
+uint16_t segDur[2 * RX_MAX];
+
 // Diagnose zum zuletzt umgewandelten Telegramm
 size_t lastSegs = 0, lastShorts = 0;
 bool lastCarrier = false;
@@ -276,8 +281,6 @@ bool lastCarrier = false;
 //  - roher Empfaenger: liefert den 38-kHz-Traeger mit -> viele sehr kurze Segmente;
 //    zusammenhaengende kurze Segmente werden zu einem Puls zusammengefasst.
 static void convert(const rmt_symbol_word_t *sym, size_t n, int64_t endUs, RxFrame &f) {
-  static uint8_t segLevel[2 * RX_MAX];
-  static uint16_t segDur[2 * RX_MAX];
   size_t ns = 0, shorts = 0;
   for (size_t i = 0; i < n; i++) {
     for (int half = 0; half < 2; half++) {
@@ -430,6 +433,9 @@ static void noteFrame(const std::vector<uint16_t> &d, bool ok, const char *why, 
              "us |";
   for (size_t i = 0; i < d.size() && i < 24; i++) l += " " + String(d[i]);
   if (d.size() > 24) l += " ...";
+  l += " | Sym " + String(symbols) + " roh:";
+  for (size_t i = 0; i < lastSegs && i < 30; i++) l += String(segLevel[i] ? " H" : " L") + String(segDur[i]);
+  if (lastSegs > 30) l += " ...";
   logbuf::add(l);
 }
 
@@ -492,30 +498,24 @@ bool begin() {
   if (rmt_new_copy_encoder(&ec, &copyEnc) != ESP_OK) return false;
   rmt_enable(txChan);
 
-  // Empfang: moeglichst mit DMA (grosser Puffer, falls der Empfaenger den Traeger mitliefert)
+  // Empfang ohne DMA (DMA lieferte am StickS3 nur Bruchstuecke), groesster Hardware-Puffer
   rmt_rx_channel_config_t rxc = {};
   rxc.gpio_num = (gpio_num_t)PIN_IR_RX;
   rxc.clk_src = RMT_CLK_SRC_DEFAULT;
   rxc.resolution_hz = RES_HZ;
-  rxc.mem_block_symbols = RX_MAX;
-  rxc.flags.with_dma = 1;
-  esp_err_t e = rmt_new_rx_channel(&rxc, &rxChan);
-  if (e == ESP_OK) {
-    rxDma = true;
-    rxSymbols = RX_MAX;
-  } else {
-    logbuf::add(String("IR: kein DMA (") + esp_err_to_name(e) + ")");
-    rxc.flags.with_dma = 0;
-    rxc.mem_block_symbols = 96;
-    if (rmt_new_rx_channel(&rxc, &rxChan) != ESP_OK) {
-      rxc.mem_block_symbols = 48;  // Fallback: kleinerer Hardware-Puffer
-      if (rmt_new_rx_channel(&rxc, &rxChan) != ESP_OK) {
-        logbuf::add("IR: Empfangskanal Fehler");
-        return false;
-      }
-    }
-    rxSymbols = rxc.mem_block_symbols;
+  const size_t sizes[] = {192, 144, 96, 48};
+  rxChan = nullptr;
+  for (size_t s : sizes) {
+    rxc.mem_block_symbols = s;
+    if (rmt_new_rx_channel(&rxc, &rxChan) == ESP_OK) break;
+    rxChan = nullptr;
   }
+  if (!rxChan) {
+    logbuf::add("IR: Empfangskanal Fehler");
+    return false;
+  }
+  rxDma = false;
+  rxSymbols = rxc.mem_block_symbols;
   logbuf::add(String("IR: Empfang ") + (rxDma ? "mit DMA" : "ohne DMA") + ", Puffer " + String(rxSymbols));
   rxQueue = xQueueCreate(8, sizeof(RxEvent));
   pendingLock = xSemaphoreCreateMutex();
@@ -544,6 +544,63 @@ void stopReceive() {
   if (!rxEnabled) return;
   rxEnabled = false;
   rmt_disable(rxChan);
+}
+
+// Pin-Messung zur Fehlersuche: liest den Empfaenger-Pin direkt (ohne RMT) fuer ms Millisekunden
+// und schreibt Flanken + Statistik ins Log. Blockiert waehrend der Messung.
+String measurePin(uint32_t ms) {
+  bool wasRx = rxEnabled;
+  stopReceive();
+  uint32_t oldMhz = getCpuFrequencyMhz();
+  setCpuFrequencyMhz(240);
+  const uint32_t cpu = getCpuFrequencyMhz();
+  static uint32_t dur[400];
+  static uint8_t lvl[400];
+  size_t n = 0;
+  uint32_t edges = 0, b30 = 0, b100 = 0, b1000 = 0, bLong = 0, mn = 0xFFFFFFFF, mx = 0;
+  const uint32_t mask = 1UL << (PIN_IR_RX - 32);
+  uint32_t level = REG_READ(GPIO_IN1_REG) & mask;
+  int idle = level ? 1 : 0;
+  uint32_t start = ESP.getCycleCount(), last = start, limit = ms * 1000UL * cpu, now;
+  while ((now = ESP.getCycleCount()) - start < limit) {
+    uint32_t l = REG_READ(GPIO_IN1_REG) & mask;
+    if (l == level) continue;
+    uint32_t d = (now - last) / cpu;
+    if (edges > 0) {  // erstes Segment (Ruhe vor dem ersten Signal) nicht werten
+      if (d < 30) b30++;
+      else if (d < 100) b100++;
+      else if (d < 1000) b1000++;
+      else bLong++;
+      if (d < mn) mn = d;
+      if (d > mx) mx = d;
+      if (n < 400) {
+        dur[n] = d;
+        lvl[n] = level ? 1 : 0;
+        n++;
+      }
+    }
+    edges++;
+    level = l;
+    last = now;
+  }
+  setCpuFrequencyMhz(oldMhz);
+  String sum = String(edges) + " Flanken";
+  String l = "PIN-MESSUNG " + String(ms) + " ms: Ruhepegel " + String(idle ? "H" : "L") + ", " + sum + ", <30us " +
+             String(b30) + ", 30-100us " + String(b100) + ", 0.1-1ms " + String(b1000) + ", >1ms " + String(bLong);
+  if (edges > 1) l += ", min " + String(mn) + "us, max " + String(mx) + "us";
+  logbuf::add(l);
+  // Rohfolge in Haeppchen ins Log (bis 160 Segmente)
+  String r;
+  for (size_t i = 0; i < n && i < 160; i++) {
+    r += String(lvl[i] ? "H" : "L") + String(dur[i]) + " ";
+    if ((i + 1) % 40 == 0) {
+      logbuf::add("PIN roh: " + r);
+      r = "";
+    }
+  }
+  if (r.length()) logbuf::add("PIN roh: " + r);
+  if (wasRx) startReceive();
+  return sum + ", kurz(<100us) " + String(b30 + b100);
 }
 
 // Holt das naechste empfangene Telegramm ab (Rohzeiten + Startzeit in us)
@@ -856,6 +913,7 @@ bool waitRelease = false;  // nach dem Aufwachen: weckende Taste ignorieren, bis
 Screen menuBack = Screen::Tvs;  // von hier wurden die Einstellungen geoeffnet
 bool confirmPower = false;      // Bestaetigung fuer "Ausschalten" statt "Entfernen"
 uint32_t irTestStart = 0;
+String pinResult;  // Ergebnis der letzten Pin-Messung
 size_t menuBackCursor = 0;
 
 // Update von GitHub
@@ -1336,6 +1394,7 @@ void activate(size_t i) {
       } else if (i == 1) {
         doUpdate();
       } else if (i == 2) {
+        pinResult = "";
         ir::startReceive();
         screen = Screen::IrTest;
         irTestStart = millis();
@@ -1599,6 +1658,15 @@ void drawIrTest() {
     canvas.setTextColor(TFT_WHITE);
     wrapText("Noch nichts empfangen", 4, 96, w - 8, 17, 2, false);
   }
+  if (pinResult.length()) {
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(COL_WARN);
+    wrapText("Pin: " + pinResult, 4, 172, w - 8, 10, 3, true);
+  } else {
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(COL_MUT);
+    wrapText("B lang: 3 s Pin-Messung (dabei eine Taste der FB halten)", 4, 172, w - 8, 10, 3, true);
+  }
   footer("A: Schliessen", "B: auf 0 setzen", COL_MUT);
 }
 
@@ -1790,6 +1858,12 @@ void loop() {
           cursor = 2;
         }
         if (bClick) ir::resetStats();
+        if (bHold) {
+          pinResult = "Messung laeuft ...";  // Hinweis zeichnen, dann messen
+          draw();
+          pinResult = ir::measurePin(3000);
+          lastInput = millis();
+        }
         break;
       case Screen::Wifi:
         if (aClick) {
