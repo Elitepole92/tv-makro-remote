@@ -18,8 +18,11 @@
 //
 // Bedienung am Stick (hochkant):
 //   Taste A (vorne)   kurz : Auswaehlen / Abspielen     lang : Optionen (neu aufnehmen, loeschen)
-//   Taste B (Seite)   kurz : naechster Eintrag          lang : Menue (WLAN, Update, Ausschalten)
+//   Taste B (Seite)   kurz : naechster Eintrag          lang : Einstellungen (WLAN, Update, IR-Test)
 //   Power-Taste       kurz : ganz aus (bleibt aus, bis man Power wieder drueckt)
+//   Ausschalten geht auch in der Startansicht (mit Bestaetigung).
+//
+// Fehlersuche: Log im Browser unter 192.168.4.1/log (Einstellungen -> WLAN / Browser).
 //
 // Strom sparen: nach 10 s wird das Display dunkler, nach 30 s schlaeft der Stick
 // tief (Display aus, Prozessor aus). Taste A oder B weckt ihn - der erste Druck
@@ -153,21 +156,94 @@ bool isRunning();
 }  // namespace web
 
 // ===========================================================================
+// Log zur Fehlersuche: Ringpuffer im RTC-Speicher. Uebersteht Tiefschlaf und
+// Neustarts (nicht aber "Ausschalten"). Abrufbar im Browser: 192.168.4.1/log
+// ===========================================================================
+namespace logbuf {
+
+constexpr size_t SIZE = 6000;
+constexpr uint32_t MAGIC = 0x31474F4C;  // "LOG1"
+RTC_NOINIT_ATTR char buf[SIZE];
+RTC_NOINIT_ATTR uint32_t magic;
+RTC_NOINIT_ATTR uint32_t head;
+RTC_NOINIT_ATTR uint32_t used;
+RTC_NOINIT_ATTR uint32_t bootNo;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+void clear() {
+  portENTER_CRITICAL(&mux);
+  head = 0;
+  used = 0;
+  portEXIT_CRITICAL(&mux);
+}
+
+void begin() {
+  if (magic != MAGIC || head >= SIZE || used > SIZE) {
+    magic = MAGIC;
+    head = 0;
+    used = 0;
+    bootNo = 0;
+  }
+  bootNo++;
+}
+
+// Zeile anhaengen: "#Start Sekunden Text"
+void add(const String &msg) {
+  char pre[28];
+  uint32_t ms = millis();
+  snprintf(pre, sizeof(pre), "#%lu %lu.%lus ", (unsigned long)bootNo, (unsigned long)(ms / 1000),
+           (unsigned long)(ms % 1000 / 100));
+  String line = String(pre) + msg + "\n";
+  portENTER_CRITICAL(&mux);
+  for (size_t i = 0; i < line.length(); i++) {
+    buf[head] = line[i];
+    head = (head + 1) % SIZE;
+    if (used < SIZE) used++;
+  }
+  portEXIT_CRITICAL(&mux);
+}
+
+String dump() {
+  char *tmp = (char *)malloc(SIZE + 1);
+  if (!tmp) return "kein Speicher";
+  size_t n;
+  portENTER_CRITICAL(&mux);
+  n = used;
+  size_t start = (head + SIZE - used) % SIZE;
+  for (size_t i = 0; i < n; i++) tmp[i] = buf[(start + i) % SIZE];
+  portEXIT_CRITICAL(&mux);
+  tmp[n] = 0;
+  const char *p = tmp;
+  if (n == SIZE) {  // Puffer uebergelaufen: angeschnittene erste Zeile weglassen
+    const char *nl = strchr(p, '\n');
+    if (nl) p = nl + 1;
+  }
+  String o(p);
+  free(tmp);
+  return o;
+}
+
+}  // namespace logbuf
+
+// ===========================================================================
 // Infrarot: Senden und Empfangen ueber das RMT-Peripheral
 // ===========================================================================
 namespace ir {
 
-constexpr uint32_t RES_HZ = 1000000;  // 1 Tick = 1 us
-constexpr size_t RX_SYMBOLS = 96;
+constexpr uint32_t RES_HZ = 1000000;     // 1 Tick = 1 us
+constexpr size_t RX_MAX = 2048;          // Empfangspuffer (Symbole) mit DMA
 constexpr size_t MAX_PENDING = 16;
+constexpr uint16_t CARRIER_MAX_US = 100; // kuerzere Segmente = 38-kHz-Traeger (roher Empfaenger)
 
 rmt_channel_handle_t txChan = nullptr;
 rmt_channel_handle_t rxChan = nullptr;
 rmt_encoder_handle_t copyEnc = nullptr;
 volatile bool rxEnabled = false;
+size_t rxSymbols = 0;  // tatsaechlich nutzbare Puffergroesse
+bool rxDma = false;
 
-// Doppelpuffer: waehrend ein Telegramm ausgewertet wird, empfaengt der andere Puffer schon weiter
-rmt_symbol_word_t rxBuf[2][RX_SYMBOLS];
+// Doppelpuffer: waehrend ein Telegramm ausgewertet wird, empfaengt der andere schon weiter
+DMA_ATTR alignas(64) rmt_symbol_word_t rxBuf[2][RX_MAX];
 int armedBuf = 0;
 QueueHandle_t rxQueue = nullptr;
 SemaphoreHandle_t pendingLock = nullptr;
@@ -187,42 +263,80 @@ static void arm(int buf) {
   rmt_receive_config_t rc = {};
   rc.signal_range_min_ns = 3000;      // kuerzere Stoerimpulse ignorieren (Hardware-Maximum ~3,1 us)
   rc.signal_range_max_ns = 12000000;  // 12 ms Ruhe = Ende eines IR-Telegramms
-  rmt_receive(rxChan, rxBuf[buf], sizeof(rxBuf[buf]), &rc);
+  rmt_receive(rxChan, rxBuf[buf], rxSymbols * sizeof(rmt_symbol_word_t), &rc);
 }
 
-// RMT-Symbole -> abwechselnd Puls/Pause in us. Empfaenger ist active-low (0 = Licht).
+// Diagnose zum zuletzt umgewandelten Telegramm
+size_t lastSegs = 0, lastShorts = 0;
+bool lastCarrier = false;
+
+// RMT-Symbole -> abwechselnd Puls/Pause in us (beginnt und endet mit Puls).
+// Zwei Empfaengerarten:
+//  - normaler IR-Empfaenger (filtert den Traeger): Pegel 0 = Licht
+//  - roher Empfaenger: liefert den 38-kHz-Traeger mit -> viele sehr kurze Segmente;
+//    zusammenhaengende kurze Segmente werden zu einem Puls zusammengefasst.
 static void convert(const rmt_symbol_word_t *sym, size_t n, int64_t endUs, RxFrame &f) {
-  f.raw.clear();
-  int lastMark = -1;
-  uint32_t total = 0;
+  static uint8_t segLevel[2 * RX_MAX];
+  static uint16_t segDur[2 * RX_MAX];
+  size_t ns = 0, shorts = 0;
   for (size_t i = 0; i < n; i++) {
     for (int half = 0; half < 2; half++) {
       uint16_t dur = half ? sym[i].duration1 : sym[i].duration0;
-      int level = half ? sym[i].level1 : sym[i].level0;
+      uint8_t level = half ? sym[i].level1 : sym[i].level0;
       if (dur == 0) continue;
-      int mark = (level == 0) ? 1 : 0;
-      if (f.raw.empty() && !mark) continue;  // fuehrende Pause verwerfen
-      if (mark == lastMark) {
-        uint32_t sum = (uint32_t)f.raw.back() + dur;
-        f.raw.back() = sum > 0xFFFF ? 0xFFFF : sum;
-      } else {
-        f.raw.push_back(dur);
-        lastMark = mark;
+      if (ns && segLevel[ns - 1] == level) {
+        uint32_t s = (uint32_t)segDur[ns - 1] + dur;
+        segDur[ns - 1] = s > 0xFFFF ? 0xFFFF : s;
+      } else if (ns < 2 * RX_MAX) {
+        segLevel[ns] = level;
+        segDur[ns] = dur;
+        ns++;
       }
-      total += dur;
     }
+  }
+  for (size_t i = 0; i < ns; i++)
+    if (segDur[i] < CARRIER_MAX_US) shorts++;
+  bool carrier = shorts >= 12;
+
+  f.raw.clear();
+  uint32_t total = 0;
+  auto push = [&](bool mark, uint32_t d) {
+    if (f.raw.empty() && !mark) return;  // fuehrende Pause verwerfen
+    bool lastIsMark = f.raw.size() % 2 == 1;
+    if (!f.raw.empty() && lastIsMark == mark) {
+      uint32_t s = (uint32_t)f.raw.back() + d;
+      f.raw.back() = s > 0xFFFF ? 0xFFFF : s;
+    } else {
+      f.raw.push_back(d > 0xFFFF ? 0xFFFF : d);
+    }
+    total += d;
+  };
+  if (carrier) {
+    uint32_t burst = 0;
+    for (size_t i = 0; i < ns; i++) {
+      if (segDur[i] < CARRIER_MAX_US) {
+        burst += segDur[i];
+      } else {
+        if (burst) push(true, burst);
+        burst = 0;
+        push(false, segDur[i]);
+      }
+    }
+    if (burst) push(true, burst);
+  } else {
+    for (size_t i = 0; i < ns; i++) push(segLevel[i] == 0, segDur[i]);
   }
   if (!f.raw.empty() && f.raw.size() % 2 == 0) {
     total -= f.raw.back();
     f.raw.pop_back();  // mit einem Puls enden
   }
   f.startUs = endUs - 12000 - (int64_t)total;
+  lastSegs = ns;
+  lastShorts = shorts;
+  lastCarrier = carrier;
 }
 
 // --- Plausibilitaet: sieht das wie eine echte Fernbedienung aus? ---
-// Ein IR-Empfaenger kann keine Pulse unter ~150 us liefern (braucht >= 10 Traegerschwingungen),
-// echte Telegramme haben >= 11 Flanken und nur wenige, enge Gruppen von Pulslaengen.
-
 // Pulse (oder Pausen) pruefen: Anzahl Einzelwerte zurueck, -1 = Rauschen
 static int checkLengths(uint16_t *s, size_t m) {
   std::sort(s, s + m);
@@ -241,16 +355,34 @@ static int checkLengths(uint16_t *s, size_t m) {
   return groups <= 6 ? singles : -1;
 }
 
-// 0 = Stoerung, 1 = Telegramm, 2 = NEC-Wiederholcode (Taste gehalten)
-static int classify(const std::vector<uint16_t> &d) {
+// 0 = Stoerung, 1 = Telegramm, 2 = NEC-Wiederholcode (Taste gehalten). why = Grund fuers Log
+static int classify(const std::vector<uint16_t> &d, const char *&why) {
   size_t n = d.size();
-  if (n == 3 && d[0] > 6500 && d[0] < 11500 && d[1] > 1600 && d[1] < 2900 && d[2] > 250 && d[2] < 900) return 2;
-  if (n < 11 || n > 400) return 0;
+  why = "ok";
+  if (n == 3 && d[0] > 6500 && d[0] < 11500 && d[1] > 1600 && d[1] < 2900 && d[2] > 250 && d[2] < 900) {
+    why = "Wiederholung";
+    return 2;
+  }
+  if (n < 11) {
+    why = "zu kurz";
+    return 0;
+  }
+  if (n > 400) {
+    why = "zu lang";
+    return 0;
+  }
   static uint16_t mk[200], sp[200];  // nur von der Empfangs-Task benutzt
   size_t nm = 0, ns = 0;
   for (size_t i = 0; i < n; i++) {
     uint16_t v = d[i];
-    if (v < 150 || v > 15000) return 0;
+    if (v < 150) {
+      why = "Puls < 150us";
+      return 0;
+    }
+    if (v > 15000) {
+      why = "Puls > 15ms";
+      return 0;
+    }
     if (i % 2 == 0) {
       if (nm < 200) mk[nm++] = v;
     } else if (ns < 200) {
@@ -258,8 +390,11 @@ static int classify(const std::vector<uint16_t> &d) {
     }
   }
   int a = checkLengths(mk, nm), b = checkLengths(sp, ns);
-  if (a < 0 || b < 0) return 0;
-  return a + b <= 4 ? 1 : 0;
+  if (a < 0 || b < 0 || a + b > 4) {
+    why = "Muster unklar";
+    return 0;
+  }
+  return 1;
 }
 
 // Diagnose fuer Anzeige (IR-Test, Aufnahme)
@@ -269,8 +404,9 @@ volatile uint16_t lastLen = 0, lastMin = 0, lastMax = 0;
 volatile bool lastValid = false;
 volatile uint32_t lastAtMs = 0;
 int64_t lastValidUs = 0;
+uint32_t lastLogMs = 0;
 
-static void noteFrame(const std::vector<uint16_t> &d, bool ok) {
+static void noteFrame(const std::vector<uint16_t> &d, bool ok, const char *why, size_t symbols) {
   uint16_t mn = 0xFFFF, mx = 0;
   for (auto v : d) {
     if (v < mn) mn = v;
@@ -283,6 +419,18 @@ static void noteFrame(const std::vector<uint16_t> &d, bool ok) {
   lastAtMs = millis();
   if (ok) statOk = statOk + 1;
   else statNoise = statNoise + 1;
+
+  // Ins Log (Stoerungen hoechstens 4x pro Sekunde, damit das Log nicht volllaeuft)
+  uint32_t now = millis();
+  if (!ok && now - lastLogMs < 250) return;
+  lastLogMs = now;
+  String l = String("IR ") + (ok ? "OK " : "weg ") + why + " | " + String(d.size()) + " Werte, " +
+             String(lastSegs) + " Seg, " + String(lastShorts) + " kurz" + (lastCarrier ? ", 38kHz roh" : "") +
+             (symbols >= rxSymbols ? ", PUFFER VOLL" : "") + " | " + String(lastMin) + "-" + String(lastMax) +
+             "us |";
+  for (size_t i = 0; i < d.size() && i < 24; i++) l += " " + String(d[i]);
+  if (d.size() > 24) l += " ...";
+  logbuf::add(l);
 }
 
 void resetStats() {
@@ -304,13 +452,17 @@ static void rxTask(void *) {
     if (!rxEnabled) continue;
     armedBuf = 1 - ev.buf;
     arm(armedBuf);
-    size_t n = ev.n > RX_SYMBOLS ? RX_SYMBOLS : ev.n;
+    size_t n = ev.n > rxSymbols ? rxSymbols : ev.n;
     convert(rxBuf[ev.buf], n, ev.timeUs, f);
     if (f.raw.empty()) continue;
-    int c = classify(f.raw);
+    const char *why;
+    int c = classify(f.raw, why);
     // Wiederholcode nur direkt nach einem echten Telegramm (Taste wird gehalten)
-    if (c == 2 && (lastValidUs == 0 || ev.timeUs - lastValidUs > 250000)) c = 0;
-    noteFrame(f.raw, c != 0);
+    if (c == 2 && (lastValidUs == 0 || ev.timeUs - lastValidUs > 250000)) {
+      c = 0;
+      why = "Wiederholung ohne Telegramm";
+    }
+    noteFrame(f.raw, c != 0, why, ev.n);
     if (c == 0) continue;  // Stoerung verwerfen
     lastValidUs = ev.timeUs;
     xSemaphoreTake(pendingLock, portMAX_DELAY);
@@ -326,7 +478,10 @@ bool begin() {
   txc.resolution_hz = RES_HZ;
   txc.mem_block_symbols = 48;
   txc.trans_queue_depth = 4;
-  if (rmt_new_tx_channel(&txc, &txChan) != ESP_OK) return false;
+  if (rmt_new_tx_channel(&txc, &txChan) != ESP_OK) {
+    logbuf::add("IR: Sendekanal Fehler");
+    return false;
+  }
 
   rmt_carrier_config_t cc = {};
   cc.frequency_hz = IR_CARRIER_HZ;
@@ -337,22 +492,38 @@ bool begin() {
   if (rmt_new_copy_encoder(&ec, &copyEnc) != ESP_OK) return false;
   rmt_enable(txChan);
 
+  // Empfang: moeglichst mit DMA (grosser Puffer, falls der Empfaenger den Traeger mitliefert)
   rmt_rx_channel_config_t rxc = {};
   rxc.gpio_num = (gpio_num_t)PIN_IR_RX;
   rxc.clk_src = RMT_CLK_SRC_DEFAULT;
   rxc.resolution_hz = RES_HZ;
-  rxc.mem_block_symbols = RX_SYMBOLS;
-  if (rmt_new_rx_channel(&rxc, &rxChan) != ESP_OK) {
-    rxc.mem_block_symbols = 48;  // Fallback: kleinerer Hardware-Puffer
-    if (rmt_new_rx_channel(&rxc, &rxChan) != ESP_OK) return false;
+  rxc.mem_block_symbols = RX_MAX;
+  rxc.flags.with_dma = 1;
+  esp_err_t e = rmt_new_rx_channel(&rxc, &rxChan);
+  if (e == ESP_OK) {
+    rxDma = true;
+    rxSymbols = RX_MAX;
+  } else {
+    logbuf::add(String("IR: kein DMA (") + esp_err_to_name(e) + ")");
+    rxc.flags.with_dma = 0;
+    rxc.mem_block_symbols = 96;
+    if (rmt_new_rx_channel(&rxc, &rxChan) != ESP_OK) {
+      rxc.mem_block_symbols = 48;  // Fallback: kleinerer Hardware-Puffer
+      if (rmt_new_rx_channel(&rxc, &rxChan) != ESP_OK) {
+        logbuf::add("IR: Empfangskanal Fehler");
+        return false;
+      }
+    }
+    rxSymbols = rxc.mem_block_symbols;
   }
+  logbuf::add(String("IR: Empfang ") + (rxDma ? "mit DMA" : "ohne DMA") + ", Puffer " + String(rxSymbols));
   rxQueue = xQueueCreate(8, sizeof(RxEvent));
   pendingLock = xSemaphoreCreateMutex();
   if (!rxQueue || !pendingLock) return false;
   rmt_rx_event_callbacks_t cbs = {};
   cbs.on_recv_done = onRxDone;
   if (rmt_rx_register_event_callbacks(rxChan, &cbs, nullptr) != ESP_OK) return false;
-  return xTaskCreate(rxTask, "ir_rx", 4096, nullptr, 10, nullptr) == pdPASS;
+  return xTaskCreate(rxTask, "ir_rx", 6144, nullptr, 10, nullptr) == pdPASS;
 }
 
 void startReceive() {
@@ -682,7 +853,8 @@ uint32_t lastDraw = 0;
 bool displayOff = false;
 bool dimmed = false;
 bool waitRelease = false;  // nach dem Aufwachen: weckende Taste ignorieren, bis losgelassen
-Screen menuBack = Screen::Tvs;  // von hier wurde das Menue geoeffnet
+Screen menuBack = Screen::Tvs;  // von hier wurden die Einstellungen geoeffnet
+bool confirmPower = false;      // Bestaetigung fuer "Ausschalten" statt "Entfernen"
 uint32_t irTestStart = 0;
 size_t menuBackCursor = 0;
 
@@ -761,11 +933,11 @@ void doUpdate();
 // ---------------------------------------------------------------- Aufnahme
 bool startRecord(size_t tv, int macro, const String &name, String &err) {
   if (busy()) {
-    err = "Es laeuft bereits eine Aufnahme/Wiedergabe";
+    err = "Erst Aufnahme bzw. Wiedergabe beenden";
     return false;
   }
   if (!irOk) {
-    err = "IR-Empfaenger nicht bereit";
+    err = "IR-Empfang nicht bereit";
     return false;
   }
   if (tv >= store::tvs.size()) {
@@ -781,6 +953,7 @@ bool startRecord(size_t tv, int macro, const String &name, String &err) {
     err = "Maximal " + String(MAX_MACROS) + " Makros pro TV-Modell";
     return false;
   }
+  logbuf::add("Aufnahme Start: " + t.name + (macro >= 0 ? " / " + t.macros[macro].name + " (ersetzen)" : String(" / neu")));
   recording = true;
   recTv = tv;
   recMacro = macro;
@@ -801,6 +974,7 @@ void finishRecord(bool keep) {
   recording = false;
   auto &t = store::tvs[recTv];
   if (keep && recSteps.empty()) {
+    logbuf::add("Aufnahme: kein Signal empfangen");
     flash("Kein Signal empfangen");
     keep = false;
   }
@@ -816,9 +990,14 @@ void finishRecord(bool keep) {
       store::selMacro = t.macros.size() - 1;
     }
     store::selTv = recTv;
-    flash(store::save() ? "Gespeichert" : "Speichern fehlgeschlagen!");
+    bool ok = store::save();
+    logbuf::add(String("Aufnahme gespeichert: ") + (recMacro >= 0 ? t.macros[recMacro].name : t.macros.back().name) + ", " +
+                String(recMacro >= 0 ? t.macros[recMacro].steps.size() : t.macros.back().steps.size()) + " Signale" +
+                (ok ? "" : ", SPEICHERN FEHLGESCHLAGEN"));
+    flash(ok ? "Gespeichert" : "Speichern fehlgeschlagen!");
   } else if (millis() >= flashUntil) {
     flash("Aufnahme verworfen");
+    logbuf::add("Aufnahme verworfen");
   }
   recSteps.clear();
   recSteps.shrink_to_fit();
@@ -853,14 +1032,14 @@ void pollRecord() {
   }
   if (recSteps.size() >= MAX_STEPS || used + recBytes > store::capacity()) {
     finishRecord(true);
-    flash("Speicher voll - Aufnahme beendet", 4000);
+    flash("Speicher voll, Aufnahme beendet", 4000);
   }
 }
 
 // --------------------------------------------------------------- Wiedergabe
 bool startPlay(size_t tv, size_t macro, String &err) {
   if (busy()) {
-    err = "Es laeuft bereits eine Aufnahme/Wiedergabe";
+    err = "Erst Aufnahme bzw. Wiedergabe beenden";
     return false;
   }
   if (tv >= store::tvs.size() || macro >= store::tvs[tv].macros.size()) {
@@ -874,6 +1053,8 @@ bool startPlay(size_t tv, size_t macro, String &err) {
   if (store::selTv != tv || store::selMacro != macro) selDirty = true;
   store::selTv = tv;
   store::selMacro = macro;
+  logbuf::add("Abspielen: " + store::tvs[tv].name + " / " + store::tvs[tv].macros[macro].name + ", " +
+              String(store::tvs[tv].macros[macro].steps.size()) + " Signale");
   playing = true;
   playTv = tv;
   playMacro = macro;
@@ -916,6 +1097,7 @@ void imuSleep(T &, long) {}
 // Tiefschlaf: Prozessor, Display und Funk aus. Taste A oder B startet ihn neu,
 // er steht dann wieder beim zuletzt benutzten Makro (alles ist im Flash gespeichert).
 void deepSleep() {
+  logbuf::add("Tiefschlaf (keine Bedienung)");
   if (selDirty) {
     selDirty = false;
     store::save();
@@ -936,6 +1118,7 @@ void deepSleep() {
 // Power-Taste: ganz aus. Einschalten wieder mit der Power-Taste.
 // Haengt er am USB-Kabel, laesst sich der Stick nicht ganz abschalten -> Tiefschlaf.
 void powerOff() {
+  logbuf::add("Ausschalten");
   if (recording) finishRecord(false);
   if (playing) stopPlay("Aus");
   if (selDirty) {
@@ -953,11 +1136,11 @@ void powerOff() {
 // ------------------------------------------------------------------ Listen
 size_t itemCount() {
   switch (screen) {
-    case Screen::Tvs: return store::tvs.size() + 1;
+    case Screen::Tvs: return store::tvs.size() + 2;
     case Screen::Macros: return store::tvs[store::selTv].macros.size() + 2;
     case Screen::Options: return optForMacro ? 4 : 2;
     case Screen::Confirm: return 2;
-    case Screen::Menu: return 5;
+    case Screen::Menu: return 4;
     default: return 0;
   }
 }
@@ -967,29 +1150,34 @@ String itemText(size_t i) {
     case Screen::Tvs: {
       size_t n = store::tvs.size();
       if (i < n) return store::tvs[i].name;
-      return "+ Neues TV";
+      if (i == n) return "+ Neues TV";
+      return "Ausschalten";
     }
     case Screen::Macros: {
       const auto &ms = store::tvs[store::selTv].macros;
       if (i < ms.size()) return ms[i].name;
-      if (i == ms.size()) return "* Aufnehmen";
-      return "< Zurueck";
+      if (i == ms.size()) return "+ Aufnehmen";
+      return "< TV-Liste";
     }
     case Screen::Options:
       if (optForMacro) {
-        const char *o[] = {"Abspielen", "Neu aufnehmen", "Loeschen", "< Zurueck"};
+        const char *o[] = {"Abspielen", "Neu aufnehmen", "Entfernen", "Abbrechen"};
         return o[i];
       } else {
-        const char *o[] = {"Loeschen", "< Zurueck"};
+        const char *o[] = {"Entfernen", "Abbrechen"};
         return o[i];
       }
     case Screen::Confirm: {
-      const char *o[] = {"Nein", "Ja, loeschen"};
+      if (confirmPower) {
+        const char *o[] = {"Nein", "Ja, ausschalten"};
+        return o[i];
+      }
+      const char *o[] = {"Nein", "Ja, entfernen"};
       return o[i];
     }
     case Screen::Menu: {
-      if (i == 0) return web::isRunning() ? "WLAN: an" : "WLAN/Browser";
-      const char *o[] = {"", "Update", "IR-Test", "Ausschalten", "< Zurueck"};
+      if (i == 0) return web::isRunning() ? "WLAN ist an" : "WLAN / Browser";
+      const char *o[] = {"", "Update", "IR-Test", "Schliessen"};
       return o[i];
     }
     default: return "";
@@ -1001,21 +1189,21 @@ String title() {
     case Screen::Tvs: return "TV-Modelle";
     case Screen::Macros: return store::tvs[store::selTv].name;
     case Screen::Options:
-    case Screen::Confirm:
       return optForMacro ? store::tvs[optTv].macros[optMacro].name : store::tvs[optTv].name;
-    case Screen::Menu: return "Menue";
+    case Screen::Confirm: return confirmPower ? "Ausschalten?" : "Entfernen?";
+    case Screen::Menu: return "Einstellungen";
     default: return "";
   }
 }
 
-// Zwei Hinweiszeilen unten
+// Hinweise unten: Hauptzeile + kleine Zeile fuer lange Tastendruecke
 void hints(const char *&l1, const char *&l2) {
+  l1 = "A: OK    B: weiter";
   switch (screen) {
-    case Screen::Tvs: l1 = "A Oeffnen  B Weiter"; l2 = "B lang: Menue"; break;
-    case Screen::Macros: l1 = "A Start  B Weiter"; l2 = "A lang: Optionen"; break;
-    case Screen::Confirm: l1 = "Wirklich loeschen?"; l2 = "A Auswahl  B Weiter"; break;
-    case Screen::Menu: l1 = "A Auswahl  B Weiter"; l2 = "B lang: Zurueck"; break;
-    default: l1 = "A Auswahl  B Weiter"; l2 = ""; break;
+    case Screen::Tvs: l2 = "B lang: Einstellungen"; break;
+    case Screen::Macros: l2 = "A lang: Optionen"; break;
+    case Screen::Menu: l2 = "B lang: schliessen"; break;
+    default: l2 = ""; break;
   }
 }
 
@@ -1061,6 +1249,10 @@ void activate(size_t i) {
         }
         screen = Screen::Macros;
         cursor = store::selMacro;
+      } else if (i == n + 1) {
+        confirmPower = true;
+        screen = Screen::Confirm;
+        cursor = 0;
       } else {
         if (n >= MAX_TVS) {
           flash("Maximal " + String(MAX_TVS) + " TV-Modelle");
@@ -1069,7 +1261,7 @@ void activate(size_t i) {
         store::tvs.push_back({String("TV ") + String(n + 1), {}});
         store::save();
         cursor = n;
-        flash("Angelegt. Name im Browser aenderbar", 3500);
+        flash("Angelegt. Name im Browser einstellbar", 3500);
       }
       break;
     }
@@ -1092,6 +1284,7 @@ void activate(size_t i) {
         } else if (i == 1) {
           if (!startRecord(optTv, optMacro, store::tvs[optTv].macros[optMacro].name, err)) flash(err);
         } else if (i == 2) {
+          confirmPower = false;
           screen = Screen::Confirm;
           cursor = 0;
         } else {
@@ -1099,6 +1292,7 @@ void activate(size_t i) {
         }
       } else {
         if (i == 0) {
+          confirmPower = false;
           screen = Screen::Confirm;
           cursor = 0;
         } else {
@@ -1107,7 +1301,15 @@ void activate(size_t i) {
       }
       break;
     case Screen::Confirm:
+      if (confirmPower) {
+        if (i == 1) powerOff();
+        screen = Screen::Tvs;
+        cursor = store::tvs.size() + 1;
+        break;
+      }
       if (i == 1) {
+        logbuf::add(optForMacro ? "Makro entfernt: " + store::tvs[optTv].macros[optMacro].name
+                                : "TV-Modell entfernt: " + store::tvs[optTv].name);
         if (optForMacro) {
           auto &ms = store::tvs[optTv].macros;
           ms.erase(ms.begin() + optMacro);
@@ -1118,7 +1320,7 @@ void activate(size_t i) {
         }
         store::clampSelection();
         store::save();
-        flash("Geloescht");
+        flash("Entfernt");
         if (!optForMacro || store::tvs.empty()) {
           screen = Screen::Tvs;
           cursor = optTv;
@@ -1137,8 +1339,6 @@ void activate(size_t i) {
         ir::startReceive();
         screen = Screen::IrTest;
         irTestStart = millis();
-      } else if (i == 3) {
-        powerOff();
       } else {
         closeMenu();
       }
@@ -1237,7 +1437,7 @@ void drawList() {
   header(title(), screen == Screen::Confirm ? COL_REC : COL_ACC);
   size_t n = itemCount();
   if (cursor >= n) cursor = 0;
-  int rows = screen == Screen::Menu ? 5 : ROWS;
+  int rows = screen == Screen::Menu ? 4 : ROWS;
   size_t first = cursor >= (size_t)rows ? cursor - rows + 1 : 0;
   canvas.setFont(&fonts::FreeSans9pt7b);
   canvas.setTextDatum(middle_left);
@@ -1258,16 +1458,27 @@ void drawList() {
     int by = ROW_Y + (h - bh) * first / (n - rows);
     canvas.fillRect(w - 3, by, 2, bh, COL_MUT);
   }
+  canvas.drawFastHLine(6, FOOT_Y - 4, w - 12, 0x31A6);
   if (screen == Screen::Menu) {  // Copyright + Version
     canvas.setFont(&fonts::Font0);
     canvas.setTextDatum(top_center);
     canvas.setTextColor(COL_MUT);
-    canvas.drawString(COPYRIGHT, w / 2, 172);
-    canvas.drawString(String("Version ") + FW_NAME, w / 2, 185);
+    canvas.drawString(COPYRIGHT, w / 2, 160);
+    canvas.drawString(String("Version ") + FW_NAME, w / 2, 174);
   }
   const char *l1, *l2;
   hints(l1, l2);
-  footer(l1, l2, COL_MUT);
+  if (millis() < flashUntil) {
+    footer("", "", COL_MUT);  // zeigt die Meldung
+  } else {
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.drawString(l1, w / 2, FOOT_Y + 2);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(COL_MUT);
+    canvas.drawString(l2, w / 2, FOOT_Y + 22);
+  }
 }
 
 void drawRecording() {
@@ -1287,13 +1498,13 @@ void drawRecording() {
   uint32_t secs = (millis() - recStartMs) / 1000;
   canvas.drawString(String(secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + String(secs % 60), w / 2, 120);
   canvas.setTextColor(TFT_WHITE);
-  if (recSteps.empty()) wrapText("Original-FB auf die Oberseite richten und Tasten druecken", 4, 140, w - 8, 17, 3, true);
-  else wrapText("Weitere Tasten druecken. Pausen werden mit aufgenommen.", 4, 140, w - 8, 17, 3, true);
+  if (recSteps.empty()) wrapText("Fernbedienung auf die Oberseite richten und die Tasten nacheinander bedienen", 4, 140, w - 8, 17, 3, true);
+  else wrapText("Weitere Tasten bedienen. Pausen werden mit aufgenommen.", 4, 140, w - 8, 17, 3, true);
   if (ir::statNoise) {
     canvas.setFont(&fonts::Font0);
     canvas.setTextColor(COL_WARN);
     canvas.setTextDatum(top_center);
-    canvas.drawString("Stoerungen ignoriert: " + String(ir::statNoise), w / 2, 192);
+    canvas.drawString("Fehlsignale ignoriert: " + String(ir::statNoise), w / 2, 192);
   }
   footer("A: Fertig", "B: Abbrechen", COL_MUT);
 }
@@ -1335,7 +1546,7 @@ void drawWifi() {
   }
   canvas.setTextColor(COL_MUT);
   wrapText("Umbenennen, Sortieren, Update-WLAN", 4, 160, w - 8, 17, 2, true);
-  footer("A: Zurueck", "A lang: WLAN aus", COL_MUT);
+  footer("A: Schliessen", "A lang: WLAN aus", COL_MUT);
 }
 
 void drawUpdate() {
@@ -1363,8 +1574,8 @@ void drawIrTest() {
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(top_left);
   canvas.setTextColor(COL_MUT);
-  canvas.drawString("Gueltig:", 6, 30);
-  canvas.drawString("Stoerungen:", 6, 50);
+  canvas.drawString("Erkannt:", 6, 30);
+  canvas.drawString("Fehlsignale:", 6, 50);
   canvas.setTextDatum(top_right);
   canvas.setTextColor(COL_OK);
   canvas.drawString(String(ir::statOk), w - 6, 30);
@@ -1377,9 +1588,9 @@ void drawIrTest() {
     bool fresh = millis() - ir::lastAtMs < 500;
     canvas.setTextColor(ir::lastValid ? COL_OK : COL_WARN);
     if (fresh) canvas.fillCircle(w - 12, 86, 5, ir::lastValid ? COL_OK : COL_WARN);
-    canvas.drawString(ir::lastValid ? "Signal OK" : "Stoerung", 6, 96);
+    canvas.drawString(ir::lastValid ? "Signal OK" : "Fehlsignal", 6, 96);
     canvas.setTextColor(TFT_WHITE);
-    canvas.drawString(String(ir::lastLen) + " Flanken", 6, 114);
+    canvas.drawString(String(ir::lastLen) + " Werte", 6, 114);
     canvas.drawString(String(ir::lastMin) + "-" + String(ir::lastMax) + " us", 6, 132);
     uint32_t ago = (millis() - ir::lastAtMs) / 1000;
     canvas.setTextColor(COL_MUT);
@@ -1388,7 +1599,7 @@ void drawIrTest() {
     canvas.setTextColor(TFT_WHITE);
     wrapText("Noch nichts empfangen", 4, 96, w - 8, 17, 2, false);
   }
-  footer("A: Zurueck", "B: Zaehler auf 0", COL_MUT);
+  footer("A: Schliessen", "B: auf 0 setzen", COL_MUT);
 }
 
 void draw() {
@@ -1508,6 +1719,7 @@ void doUpdate() {
   if (hadAp) web::start();
   screen = Screen::Menu;
   cursor = 1;
+  logbuf::add("Update: " + result);
   flash(result, 6000);
   wake();
 }
@@ -1517,6 +1729,7 @@ uint32_t bootMs = 0;
 
 void begin() {
   esp_ota_mark_app_valid_cancel_rollback();  // diese Version laeuft: behalten
+  logbuf::begin();
   setCpuFrequencyMhz(CPU_MHZ);
   WiFi.persistent(false);
   WiFi.mode(WIFI_OFF);  // Funk aus, bis er gebraucht wird
@@ -1525,9 +1738,14 @@ void begin() {
   waitRelease = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
   canvas.setColorDepth(16);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
+  logbuf::add(String("Start: Version ") + FW_NAME + " (Build " + String(FW_BUILD) + "), Neustartgrund " +
+              String((int)esp_reset_reason()) + (waitRelease ? ", per Taste geweckt" : "") + ", Akku " +
+              String(M5.Power.getBatteryLevel()) + "%");
   storeOk = store::begin();
   store::wifiOn = false;  // Stick-WLAN startet nie von selbst (Strom)
   irOk = ir::begin();
+  if (!storeOk) logbuf::add("FEHLER: Speicher");
+  if (!irOk) logbuf::add("FEHLER: IR");
   screen = Screen::Macros;  // direkt beim zuletzt benutzten TV-Modell starten
   if (store::tvs.empty()) screen = Screen::Tvs;
   cursor = store::selMacro;
@@ -1676,6 +1894,9 @@ static const char INDEX_HTML[] PROGMEM =
     "<input id=\"us\" placeholder=\"WLAN-Name (z.B. iPhone von ...)\" autocapitalize=\"none\" autocorrect=\"off\" style=\"width:100%;box-sizing:border-box;padding:9px;margin:4px 0;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)\">\n"
     "<input id=\"up\" type=\"password\" placeholder=\"Passwort\" style=\"width:100%;box-sizing:border-box;padding:9px;margin:4px 0 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)\">\n"
     "<button class=\"p\" onclick=\"saveWifi()\">WLAN speichern</button></div>\n"
+    "<div class=\"card\"><b>Fehlersuche</b>\n"
+    "<p class=\"mut\">Das Log zeigt, was der Stick zuletzt gemacht und empfangen hat (übersteht Tiefschlaf, nicht Ausschalten). Zum Weitergeben: Log öffnen, alles markieren, kopieren.</p>\n"
+    "<a href=\"/log\" target=\"_blank\"><button class=\"p\">Log öffnen</button></a> <button onclick=\"if(confirm('Log leeren?'))api('logclear')\">Log leeren</button></div>\n"
     "<p class=\"mut\">Aufnehmen: Original-Fernbedienung aus ca. 20-30 cm auf die Oberseite des StickS3 richten und die Tasten in Ruhe nacheinander drücken. Die Pausen werden mit aufgenommen und beim Abspielen genauso wiederholt.</p>\n"
     "</main>\n"
     "<script>\n"
@@ -1779,7 +2000,7 @@ bool isRunning() { return running; }
 
 bool notBusy() {
   if (app::busy()) {
-    fail("Gerade laeuft eine Aufnahme oder Wiedergabe");
+    fail("Erst Aufnahme bzw. Wiedergabe beenden");
     return false;
   }
   return true;
@@ -1793,6 +2014,23 @@ bool argTv(size_t &tv) {
   }
   tv = v;
   return true;
+}
+
+// Log zur Fehlersuche (Text). Am iPhone: Seite oeffnen, alles markieren, kopieren.
+void handleLog() {
+  String o = String("TV-Makro-Fernbedienung ") + FW_NAME + " (Build " + String(FW_BUILD) + ")\n";
+  o += "Laufzeit " + String(millis() / 1000) + " s, Akku " + String(M5.Power.getBatteryLevel()) + "%, freier RAM " +
+       String(ESP.getFreeHeap()) + "\n";
+  o += String("IR: ") + (ir::rxDma ? "DMA" : "ohne DMA") + ", Puffer " + String(ir::rxSymbols) + ", erkannt " +
+       String(ir::statOk) + ", Fehlsignale " + String(ir::statNoise) + "\n";
+  o += "TV-Modelle " + String(store::tvs.size()) + ", Makrodaten " + String(store::totalBytes()) + " Byte\n\n";
+  o += logbuf::dump();
+  server.send(200, "text/plain; charset=utf-8", o);
+}
+
+void handleLogClear() {
+  logbuf::clear();
+  ok();
 }
 
 void handleData() {
@@ -1946,15 +2184,19 @@ void start() {
     server.on("/api/addtv", HTTP_POST, handleAddTv);
     server.on("/api/move", HTTP_POST, handleMove);
     server.on("/api/updwifi", HTTP_POST, handleUpdWifi);
+    server.on("/log", HTTP_GET, handleLog);
+    server.on("/api/logclear", HTTP_POST, handleLogClear);
     server.onNotFound([] { server.send(404, "text/plain", "Nicht gefunden"); });
   }
   server.begin();
   running = true;
   lastClientMs = millis();
+  logbuf::add("WLAN an");
 }
 
 void stop() {
   if (!running) return;
+  logbuf::add("WLAN aus");
   server.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);

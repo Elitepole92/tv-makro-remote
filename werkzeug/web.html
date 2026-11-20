@@ -29,6 +29,9 @@ h2{font-size:1.1em;margin:0 0 4px;display:flex;align-items:center;gap:6px}
 <input id="us" placeholder="WLAN-Name (z.B. iPhone von ...)" autocapitalize="none" autocorrect="off" style="width:100%;box-sizing:border-box;padding:9px;margin:4px 0;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)">
 <input id="up" type="password" placeholder="Passwort" style="width:100%;box-sizing:border-box;padding:9px;margin:4px 0 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)">
 <button class="p" onclick="saveWifi()">WLAN speichern</button></div>
+<div class="card"><b>Fehlersuche</b>
+<p class="mut">Das Log zeigt, was der Stick zuletzt gemacht und empfangen hat (übersteht Tiefschlaf, nicht Ausschalten). Zum Weitergeben: Log öffnen, alles markieren, kopieren.</p>
+<a href="/log" target="_blank"><button class="p">Log öffnen</button></a> <button onclick="if(confirm('Log leeren?'))api('logclear')">Log leeren</button></div>
 <p class="mut">Aufnehmen: Original-Fernbedienung aus ca. 20-30 cm auf die Oberseite des StickS3 richten und die Tasten in Ruhe nacheinander drücken. Die Pausen werden mit aufgenommen und beim Abspielen genauso wiederholt.</p>
 </main>
 <script>
