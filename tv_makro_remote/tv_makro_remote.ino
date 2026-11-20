@@ -59,6 +59,7 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <vector>
+#include <algorithm>
 
 #if __has_include("version.h")
 #include "version.h"  // legt GitHub beim Bauen an
@@ -140,7 +141,7 @@ struct Reader {
   bool ok;
 };
 
-enum class Screen : uint8_t { Tvs, Macros, Options, Confirm, Recording, Playing, Wifi, Update, Menu };
+enum class Screen : uint8_t { Tvs, Macros, Options, Confirm, Recording, Playing, Wifi, Update, Menu, IrTest };
 
 // Vorwaertsdeklarationen (Web <-> Bedienung)
 namespace web {
@@ -184,7 +185,7 @@ static bool IRAM_ATTR onRxDone(rmt_channel_handle_t, const rmt_rx_done_event_dat
 
 static void arm(int buf) {
   rmt_receive_config_t rc = {};
-  rc.signal_range_min_ns = 1250;      // kuerzere Stoerimpulse ignorieren
+  rc.signal_range_min_ns = 3000;      // kuerzere Stoerimpulse ignorieren (Hardware-Maximum ~3,1 us)
   rc.signal_range_max_ns = 12000000;  // 12 ms Ruhe = Ende eines IR-Telegramms
   rmt_receive(rxChan, rxBuf[buf], sizeof(rxBuf[buf]), &rc);
 }
@@ -218,6 +219,81 @@ static void convert(const rmt_symbol_word_t *sym, size_t n, int64_t endUs, RxFra
   f.startUs = endUs - 12000 - (int64_t)total;
 }
 
+// --- Plausibilitaet: sieht das wie eine echte Fernbedienung aus? ---
+// Ein IR-Empfaenger kann keine Pulse unter ~150 us liefern (braucht >= 10 Traegerschwingungen),
+// echte Telegramme haben >= 11 Flanken und nur wenige, enge Gruppen von Pulslaengen.
+
+// Pulse (oder Pausen) pruefen: Anzahl Einzelwerte zurueck, -1 = Rauschen
+static int checkLengths(uint16_t *s, size_t m) {
+  std::sort(s, s + m);
+  int groups = 0, singles = 0;
+  size_t start = 0;
+  for (size_t i = 1; i <= m; i++) {
+    if (i < m && (uint32_t)s[i] * 100 <= (uint32_t)s[i - 1] * 135) continue;  // gehoert noch zur Gruppe
+    size_t cnt = i - start;
+    size_t trim = cnt >= 8 ? cnt / 10 : 0;  // Ausreisser an den Raendern ignorieren
+    uint32_t lo = s[start + trim], hi = s[i - 1 - trim];
+    if (hi * 10 > lo * 35) return -1;  // Gruppe viel zu breit
+    groups++;
+    if (cnt == 1) singles++;
+    start = i;
+  }
+  return groups <= 6 ? singles : -1;
+}
+
+// 0 = Stoerung, 1 = Telegramm, 2 = NEC-Wiederholcode (Taste gehalten)
+static int classify(const std::vector<uint16_t> &d) {
+  size_t n = d.size();
+  if (n == 3 && d[0] > 6500 && d[0] < 11500 && d[1] > 1600 && d[1] < 2900 && d[2] > 250 && d[2] < 900) return 2;
+  if (n < 11 || n > 400) return 0;
+  static uint16_t mk[200], sp[200];  // nur von der Empfangs-Task benutzt
+  size_t nm = 0, ns = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint16_t v = d[i];
+    if (v < 150 || v > 15000) return 0;
+    if (i % 2 == 0) {
+      if (nm < 200) mk[nm++] = v;
+    } else if (ns < 200) {
+      sp[ns++] = v;
+    }
+  }
+  int a = checkLengths(mk, nm), b = checkLengths(sp, ns);
+  if (a < 0 || b < 0) return 0;
+  return a + b <= 4 ? 1 : 0;
+}
+
+// Diagnose fuer Anzeige (IR-Test, Aufnahme)
+volatile uint32_t statOk = 0;
+volatile uint32_t statNoise = 0;
+volatile uint16_t lastLen = 0, lastMin = 0, lastMax = 0;
+volatile bool lastValid = false;
+volatile uint32_t lastAtMs = 0;
+int64_t lastValidUs = 0;
+
+static void noteFrame(const std::vector<uint16_t> &d, bool ok) {
+  uint16_t mn = 0xFFFF, mx = 0;
+  for (auto v : d) {
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  lastLen = d.size();
+  lastMin = d.empty() ? 0 : mn;
+  lastMax = mx;
+  lastValid = ok;
+  lastAtMs = millis();
+  if (ok) statOk = statOk + 1;
+  else statNoise = statNoise + 1;
+}
+
+void resetStats() {
+  statOk = 0;
+  statNoise = 0;
+  lastLen = 0;
+  lastMin = 0;
+  lastMax = 0;
+  lastAtMs = 0;
+}
+
 // Eigene Task: sofort neu scharf schalten, damit auch schnelle Wiederholungen
 // (z.B. Sony: 3 Telegramme im Abstand von ~45 ms) vollstaendig erfasst werden.
 static void rxTask(void *) {
@@ -230,7 +306,13 @@ static void rxTask(void *) {
     arm(armedBuf);
     size_t n = ev.n > RX_SYMBOLS ? RX_SYMBOLS : ev.n;
     convert(rxBuf[ev.buf], n, ev.timeUs, f);
-    if (f.raw.size() < 3) continue;  // Stoerung
+    if (f.raw.empty()) continue;
+    int c = classify(f.raw);
+    // Wiederholcode nur direkt nach einem echten Telegramm (Taste wird gehalten)
+    if (c == 2 && (lastValidUs == 0 || ev.timeUs - lastValidUs > 250000)) c = 0;
+    noteFrame(f.raw, c != 0);
+    if (c == 0) continue;  // Stoerung verwerfen
+    lastValidUs = ev.timeUs;
     xSemaphoreTake(pendingLock, portMAX_DELAY);
     if (pending.size() < MAX_PENDING) pending.push_back(f);
     xSemaphoreGive(pendingLock);
@@ -275,6 +357,8 @@ bool begin() {
 
 void startReceive() {
   if (!rxChan || rxEnabled) return;
+  resetStats();
+  lastValidUs = 0;
   xSemaphoreTake(pendingLock, portMAX_DELAY);
   pending.clear();
   xSemaphoreGive(pendingLock);
@@ -599,6 +683,7 @@ bool displayOff = false;
 bool dimmed = false;
 bool waitRelease = false;  // nach dem Aufwachen: weckende Taste ignorieren, bis losgelassen
 Screen menuBack = Screen::Tvs;  // von hier wurde das Menue geoeffnet
+uint32_t irTestStart = 0;
 size_t menuBackCursor = 0;
 
 // Update von GitHub
@@ -872,7 +957,7 @@ size_t itemCount() {
     case Screen::Macros: return store::tvs[store::selTv].macros.size() + 2;
     case Screen::Options: return optForMacro ? 4 : 2;
     case Screen::Confirm: return 2;
-    case Screen::Menu: return 4;
+    case Screen::Menu: return 5;
     default: return 0;
   }
 }
@@ -904,7 +989,7 @@ String itemText(size_t i) {
     }
     case Screen::Menu: {
       if (i == 0) return web::isRunning() ? "WLAN: an" : "WLAN/Browser";
-      const char *o[] = {"", "Update", "Ausschalten", "< Zurueck"};
+      const char *o[] = {"", "Update", "IR-Test", "Ausschalten", "< Zurueck"};
       return o[i];
     }
     default: return "";
@@ -1049,6 +1134,10 @@ void activate(size_t i) {
       } else if (i == 1) {
         doUpdate();
       } else if (i == 2) {
+        ir::startReceive();
+        screen = Screen::IrTest;
+        irTestStart = millis();
+      } else if (i == 3) {
         powerOff();
       } else {
         closeMenu();
@@ -1148,7 +1237,7 @@ void drawList() {
   header(title(), screen == Screen::Confirm ? COL_REC : COL_ACC);
   size_t n = itemCount();
   if (cursor >= n) cursor = 0;
-  int rows = screen == Screen::Menu ? 4 : ROWS;
+  int rows = screen == Screen::Menu ? 5 : ROWS;
   size_t first = cursor >= (size_t)rows ? cursor - rows + 1 : 0;
   canvas.setFont(&fonts::FreeSans9pt7b);
   canvas.setTextDatum(middle_left);
@@ -1173,8 +1262,8 @@ void drawList() {
     canvas.setFont(&fonts::Font0);
     canvas.setTextDatum(top_center);
     canvas.setTextColor(COL_MUT);
-    canvas.drawString(COPYRIGHT, w / 2, 150);
-    canvas.drawString(String("Version ") + FW_NAME, w / 2, 164);
+    canvas.drawString(COPYRIGHT, w / 2, 172);
+    canvas.drawString(String("Version ") + FW_NAME, w / 2, 185);
   }
   const char *l1, *l2;
   hints(l1, l2);
@@ -1198,8 +1287,14 @@ void drawRecording() {
   uint32_t secs = (millis() - recStartMs) / 1000;
   canvas.drawString(String(secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + String(secs % 60), w / 2, 120);
   canvas.setTextColor(TFT_WHITE);
-  if (recSteps.empty()) wrapText("Original-FB auf die Oberseite richten und Tasten druecken", 4, 146, w - 8, 17, 3, true);
-  else wrapText("Weitere Tasten druecken. Pausen werden mit aufgenommen.", 4, 146, w - 8, 17, 3, true);
+  if (recSteps.empty()) wrapText("Original-FB auf die Oberseite richten und Tasten druecken", 4, 140, w - 8, 17, 3, true);
+  else wrapText("Weitere Tasten druecken. Pausen werden mit aufgenommen.", 4, 140, w - 8, 17, 3, true);
+  if (ir::statNoise) {
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(COL_WARN);
+    canvas.setTextDatum(top_center);
+    canvas.drawString("Stoerungen ignoriert: " + String(ir::statNoise), w / 2, 192);
+  }
   footer("A: Fertig", "B: Abbrechen", COL_MUT);
 }
 
@@ -1262,6 +1357,40 @@ void drawUpdate() {
   canvas.drawString(updPct >= 0 ? "Nicht ausschalten!" : "B: Abbrechen", w / 2, FOOT_Y + 8);
 }
 
+void drawIrTest() {
+  int w = canvas.width();
+  header("IR-Test", COL_ACC);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(COL_MUT);
+  canvas.drawString("Gueltig:", 6, 30);
+  canvas.drawString("Stoerungen:", 6, 50);
+  canvas.setTextDatum(top_right);
+  canvas.setTextColor(COL_OK);
+  canvas.drawString(String(ir::statOk), w - 6, 30);
+  canvas.setTextColor(ir::statNoise ? COL_WARN : TFT_WHITE);
+  canvas.drawString(String(ir::statNoise), w - 6, 50);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(COL_MUT);
+  canvas.drawString("Zuletzt:", 6, 78);
+  if (ir::lastAtMs) {
+    bool fresh = millis() - ir::lastAtMs < 500;
+    canvas.setTextColor(ir::lastValid ? COL_OK : COL_WARN);
+    if (fresh) canvas.fillCircle(w - 12, 86, 5, ir::lastValid ? COL_OK : COL_WARN);
+    canvas.drawString(ir::lastValid ? "Signal OK" : "Stoerung", 6, 96);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.drawString(String(ir::lastLen) + " Flanken", 6, 114);
+    canvas.drawString(String(ir::lastMin) + "-" + String(ir::lastMax) + " us", 6, 132);
+    uint32_t ago = (millis() - ir::lastAtMs) / 1000;
+    canvas.setTextColor(COL_MUT);
+    canvas.drawString("vor " + String(ago) + " s", 6, 150);
+  } else {
+    canvas.setTextColor(TFT_WHITE);
+    wrapText("Noch nichts empfangen", 4, 96, w - 8, 17, 2, false);
+  }
+  footer("A: Zurueck", "B: Zaehler auf 0", COL_MUT);
+}
+
 void draw() {
   canvas.fillSprite(TFT_BLACK);
   switch (screen) {
@@ -1269,6 +1398,7 @@ void draw() {
     case Screen::Playing: drawPlaying(); break;
     case Screen::Wifi: drawWifi(); break;
     case Screen::Update: drawUpdate(); break;
+    case Screen::IrTest: drawIrTest(); break;
     default: drawList(); break;
   }
   if (!irOk || !storeOk) {
@@ -1435,6 +1565,14 @@ void loop() {
       case Screen::Playing:
         if (aClick || bClick) stopPlay("Gestoppt");
         break;
+      case Screen::IrTest:
+        if (aClick || aHold) {
+          ir::stopReceive();
+          screen = Screen::Menu;
+          cursor = 2;
+        }
+        if (bClick) ir::resetStats();
+        break;
       case Screen::Wifi:
         if (aClick) {
           screen = Screen::Menu;
@@ -1471,6 +1609,14 @@ void loop() {
   }
 
   // Strom sparen: 10 s dunkler, 30 s Tiefschlaf (mit Stick-WLAN an: nur Display aus)
+  if (screen == Screen::IrTest) {
+    if (millis() - irTestStart < 180000) lastInput = millis();  // Test haelt max. 3 min wach
+    else {
+      ir::stopReceive();
+      screen = Screen::Menu;
+      cursor = 2;
+    }
+  }
   if (busy()) lastInput = millis();
   uint32_t idle = millis() - lastInput;
   if (!displayOff && !dimmed && idle > DISPLAY_DIM_MS) {

@@ -17,12 +17,16 @@ Gespeichert werden die Rohsignale, deshalb klappt das mit jeder TV-Marke.
 | Taste | kurz | lang |
 |---|---|---|
 | **A** (vorne) | Öffnen / Abspielen / Fertig | Optionen (neu aufnehmen, löschen) |
-| **B** (Seite) | nächster Eintrag | **Menü**: WLAN/Browser, Update, Ausschalten (Copyright + Version) |
+| **B** (Seite) | nächster Eintrag | **Menü**: WLAN/Browser, Update, IR-Test, Ausschalten (Copyright + Version) |
 | **Power** | ganz aus – bleibt aus, bis Power wieder gedrückt wird | |
 
 **Aufnehmen:** TV-Modell öffnen → *Aufnehmen* → Original-Fernbedienung
 aus 20–30 cm auf die **Oberseite** des Sticks richten, Tasten in Ruhe nacheinander
 drücken → **A** = fertig.
+
+**IR-Test:** B lang → *IR-Test* zeigt live, was der Empfänger sieht: gültige Signale
+und ignorierte Störungen (mit Anzahl Flanken und Pulslängen). Störungen ohne
+Fernbedienung deuten auf Störquellen hin (Lampen, Sonne, Elektronik in der Nähe).
 
 **Browser (optional):** B lang → *WLAN/Browser* → am Handy ins WLAN `TV-Remote-xxxx`
 (Passwort `fernbedienung`) → http://192.168.4.1 → umbenennen, sortieren, löschen.
